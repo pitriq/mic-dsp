@@ -1,0 +1,6 @@
+/target/
+.DS_Store
+/driver/build/
+/recordings/
+*.wav
+*.asd
