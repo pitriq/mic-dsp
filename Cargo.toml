@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/nnnoiseless"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.95"
+
+[profile.release]
+debug = 1
+# A panic must never unwind out of the IOProc into Core Audio's frames; launchd restarts micd.
+panic = "abort"
