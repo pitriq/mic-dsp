@@ -1,0 +1,14 @@
+[package]
+name = "nnnoiseless"
+version = "0.5.2"
+edition = "2018"
+license = "BSD-3-Clause"
+description = "nnnoiseless 0.5.2 with FFT state owned by each DenoiseState, so processing never allocates"
+publish = false
+
+[dependencies]
+once_cell = "1.9"
+realfft = "3.5"
+
+[dev-dependencies]
+upstream = { package = "nnnoiseless", version = "=0.5.2", default-features = false }
