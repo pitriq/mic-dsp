@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nnnoiseless"]
+members = ["crates/dsp", "crates/nnnoiseless"]
 
 [workspace.package]
 edition = "2021"
