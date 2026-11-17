@@ -1,0 +1,31 @@
+[package]
+name = "dsp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "The mic-dsp vocal chain: stages, calibration and the offline WAV mode. No platform dependencies."
+publish = false
+
+[features]
+default = ["offline"]
+# WAV processing, the Frame report and the `mic-dsp` CLI. micd builds without it.
+offline = ["dep:hound"]
+
+[dependencies]
+nnnoiseless = { path = "../nnnoiseless" }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+hound = { version = "3.5", optional = true }
+# Chain::process runs inside assert_no_alloc in debug builds. In a workspace build micd's
+# default features compile the check out of release builds, so tests/no_alloc.rs proves
+# something only in debug (or in release with `-p dsp`).
+assert_no_alloc = { version = "1.1", default-features = false }
+
+[dev-dependencies]
+# The config tests write TOML.
+toml = { version = "0.9", default-features = false, features = ["display"] }
+
+[[bin]]
+name = "mic-dsp"
+path = "src/bin/mic-dsp.rs"
+required-features = ["offline"]
