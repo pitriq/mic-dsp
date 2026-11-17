@@ -1,0 +1,29 @@
+[package]
+name = "micd"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Always-on virtual mic daemon: Komplete Audio 1 in, vocal chain, Francisco's Mic out"
+publish = false
+
+[dependencies]
+assert_no_alloc = "1.1.2"
+dsp = { path = "../dsp", default-features = false }
+libc = "0.2"
+objc2-core-audio = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "AudioHardware",
+    "objc2-core-audio-types",
+] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CoreAudioBaseTypes",
+] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFBase",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
