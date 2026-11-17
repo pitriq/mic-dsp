@@ -50,9 +50,17 @@ Owner's baseline, measured from `recordings/` (not in git) at the normal knob po
 
 To reach the −12 to −10 dBFS peak target the trim adds about +8 dB, which puts the hiss near −60 dBFS before the denoiser and expander.
 
+As built:
+- **Speech level:** the calibration estimates the 95th percentile of pre-trim 100 ms speech peaks as a center plus a spread. The center is an average of speech-window peaks in dB: 0.1 per window, or 0.3 while the trim slews fast. The spread is a slow 95th-percentile tracker of peak minus center, learned only while the trim is near target. A knob step moves the center and leaves the spread alone, so no knob detector is needed. A faster center latched the fast slew on the owner's loud phrases.
+- **The chain's own measurement of the baseline** (with its voice detection): speech p95 −18 dBFS, a mean of −25, floor −67. These are the default calibration state.
+- **Compressor:** 2:1 from 6 dB below the target, with makeup so the target maps to itself, and an instant attack. With an attack time the loudest pitch pulse passed and the output p95 landed at −9.6.
+- **Pause:** no frame with voice probability 0.6 or more within 300 ms. Laughs and breaths open the expander by design, so they don't count as pauses.
+- **Latency:** the chain adds 1008 samples (21 ms): 480 re-block, 480 denoiser, 48 limiter look-ahead. Komplete in to Francisco's Mic is about 40 ms before the reader's own buffer.
+- **IO cycle usage 0.5:** at the HAL default of 1.0 the core stays at its lowest clock and the same work costs 1.6% of a core; at 0.5 it is 0.6%.
+
 ## Roadmap
 
-1. **Feasibility gate (current).** Prove these before building DSP on top of them:
+1. **Feasibility gate (passed).** Prove these before building DSP on top of them:
    - The split driver loads, ad-hoc signed, on macOS 26.6.
    - Mic permission works when the daemon is started by launchd.
    - A private aggregate passes audio and nnnoiseless for an hour, through an unplug and a sleep.
@@ -60,7 +68,7 @@ To reach the −12 to −10 dBFS peak target the trim adds about +8 dB, which pu
    - CPU, footprint and latency are measured.
 
    If the resource budget fails, stop and report it.
-2. **MVP:** the chain above, calibration, the offline WAV mode, on-demand capture, and logging through `os_log` (or only while active).
+2. **MVP (current):** the chain above, calibration, the offline WAV mode, on-demand capture, and logging through `os_log` (or only while active).
 3. **Quality:** add or tune a stage only when a loudness-matched A/B on recordings justifies it. Test in every target app and run a 72 h soak.
 4. **Only if measurements show clicks:** steer BlackHole's adjustable clock, then try `rubato`.
 
@@ -69,7 +77,7 @@ Out of scope: a leveler, a knob-change rule, an Audio MIDI Setup aggregate, driv
 ## Testing
 
 - Unit-test each stage against known signals, for example the high-pass response at 30, 75 and 1000 Hz, the compressor's static curve, and the limiter never exceeding its ceiling.
-- Calibration is tested offline with WAV files that contain ±10 dB gain steps in speech and in pauses. The trim must settle within 2 s of the first speech after a step.
+- Calibration is tested offline with WAV files that contain ±10 dB gain steps in speech and in pauses. The trim must settle to ±1 dB within 3 s of the first speech after a step. 2 s would need the noise floor as a witness for knob steps, which is the knob-change rule this design excludes; the owner chose 3 s. `mic-dsp process` finds the steps and reports the settle times.
 - Performance is a release-build benchmark per 480-sample frame.
 - Live checks:
   - Record the virtual mic in Ableton and compare it with the baseline.
