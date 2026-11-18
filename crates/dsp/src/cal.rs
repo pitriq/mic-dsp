@@ -452,10 +452,10 @@ mod tests {
         (settles[settles.len() / 2], settles[settles.len() - 1])
     }
 
-    // The Frame asked for 2 s to 1 dB after a 10 dB step; the owner relaxed it to 3 s rather
-    // than let the noise floor drive the trim. Without the floor, 2 s of speech does not pin its
-    // own level to 1 dB, and an average fast enough to see a 10 dB step inside 1 s also takes
-    // the owner's loud phrases for steps. The tests below pin what the trim does do.
+    // The trim settles to 1 dB within 3 s of a 10 dB step, not 2 s, because the noise floor does
+    // not drive it. Without the floor, 2 s of speech does not pin its own level to 1 dB, and an
+    // average fast enough to see a 10 dB step inside 1 s also takes loud phrases for steps.
+    // The tests below pin what the trim does do.
 
     #[test]
     fn a_10_db_step_in_speech_settles_to_3_db_in_a_few_seconds() {

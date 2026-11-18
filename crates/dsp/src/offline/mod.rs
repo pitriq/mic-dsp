@@ -1,4 +1,4 @@
-//! The offline mode: WAV in, WAV out, the Frame report and the benchmark. This is what the
+//! The offline mode: WAV in, WAV out, the target report and the benchmark. This is what the
 //! `mic-dsp` CLI calls. It allocates freely and never runs on the audio thread.
 
 mod report;
@@ -38,7 +38,7 @@ impl std::error::Error for Error {}
 
 /// Runs channel 1 of a 48 kHz WAV through the chain and writes the result as 24-bit stereo,
 /// the same length as the source and aligned with it. The report checks the result against
-/// the Frame.
+/// the targets.
 pub fn process_file(
     input: &Path,
     output: &Path,
@@ -51,7 +51,7 @@ pub fn process_file(
     Ok(Report::new(&source, &processed, &trace, config))
 }
 
-/// The Frame levels of any 48 kHz recording, such as a capture of the live virtual mic,
+/// The levels of any 48 kHz recording, such as a capture of the live virtual mic,
 /// judged against the default target.
 pub fn levels_file(path: &Path) -> Result<Levels, Error> {
     Ok(Levels::of(&wav::read(path)?, &Config::default()))
@@ -232,9 +232,9 @@ mod tests {
             "{report}"
         );
         assert!(report.to_string().ends_with(if report.pass() {
-            "Frame: PASS"
+            "Targets: PASS"
         } else {
-            "Frame: FAIL"
+            "Targets: FAIL"
         }));
     }
 

@@ -1,4 +1,4 @@
-//! The Frame report: the levels of a recording, the knob steps found in an input, and how
+//! The target report: the levels of a recording, the knob steps found in an input, and how
 //! long the trim took to settle after each.
 //!
 //! Everything works on a grid of 100 ms windows. A window is speech when at least half its
@@ -110,7 +110,7 @@ fn median(values: &mut [f32]) -> f32 {
     }
 }
 
-/// The levels the Frame is about.
+/// The levels the targets are checked on.
 #[derive(Clone, Copy, Debug)]
 pub struct Levels {
     /// 95th percentile and median of the speech windows' peaks.
@@ -172,7 +172,7 @@ impl Levels {
         (self.pause_windows > 0).then_some(self.pause_rms_dbfs <= FLOOR_DBFS)
     }
 
-    /// Whether the levels meet the Frame: speech peaks on the target and pauses under the
+    /// Whether the levels meet the targets: speech peaks on the target and pauses under the
     /// floor. A recording with neither speech nor pauses fails.
     pub fn pass(&self) -> bool {
         let (speech, pauses) = (self.speech_ok(), self.pauses_ok());
@@ -464,7 +464,7 @@ impl Report {
         }
     }
 
-    /// Whether the file meets the Frame: the output levels, and every step settled in time.
+    /// Whether the file meets the targets: the output levels, and every step settled in time.
     pub fn pass(&self) -> bool {
         self.output.pass() && self.steps.iter().all(Step::pass)
     }
@@ -515,7 +515,7 @@ impl fmt::Display for Report {
         for step in &self.steps {
             writeln!(f, "  {step}")?;
         }
-        write!(f, "Frame: {}", if self.pass() { "PASS" } else { "FAIL" })
+        write!(f, "Targets: {}", if self.pass() { "PASS" } else { "FAIL" })
     }
 }
 

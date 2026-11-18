@@ -1,6 +1,6 @@
 # mic-dsp
 
-A personal, always-on macOS virtual mic. The owner's SM7dB goes into a Komplete Audio 1, a Rust daemon runs it through a vocal chain, and the result goes to a BlackHole-based virtual input that any app can select. It has one user and one machine (MacBook Pro M4 Pro, macOS 26). The repo is public on GitHub, but nothing built from it is published. The design, its decisions and the roadmap are in `docs/design.md`; read it before changing the DSP or the audio plumbing.
+A personal, always-on macOS virtual mic. The owner's SM7dB goes into a Komplete Audio 1, a Rust daemon runs it through a vocal chain, and the result goes to a BlackHole-based virtual input that any app can select. It has one user and one machine (MacBook Pro M4 Pro, macOS 26). The repo is public on GitHub, but nothing built from it is published. How it works and why is in `docs/design.md`; read it before changing the DSP or the audio plumbing.
 
 ## Constraints
 

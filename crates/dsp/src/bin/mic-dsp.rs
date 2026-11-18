@@ -1,5 +1,5 @@
 //! The offline CLI: process a recording through the chain, check a recording's levels
-//! against the Frame, or benchmark the chain.
+//! against the targets, or benchmark the chain.
 
 use dsp::{offline, CalState, Config};
 use std::path::{Path, PathBuf};
@@ -8,13 +8,13 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage:
   mic-dsp process <in.wav> <out.wav> [--config <config.toml>] [--state <state.toml>]
-      Runs channel 1 of a 48 kHz WAV through the chain and reports against the Frame.
+      Runs channel 1 of a 48 kHz WAV through the chain and reports against the targets.
   mic-dsp levels <file.wav>
-      Reports the Frame levels of any 48 kHz recording.
+      Reports the levels of any 48 kHz recording against the targets.
   mic-dsp bench [<file.wav>]
       Times the chain per 480-sample block. Use a release build.
 
-Exit status: 0 when the Frame is met, 1 when it is not, 2 on a usage or file error.";
+Exit status: 0 when the targets are met, 1 when it is not, 2 on a usage or file error.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether the Frame was met.
+/// Whether the targets were met.
 fn run(args: &[String]) -> Result<bool, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
