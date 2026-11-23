@@ -12,6 +12,7 @@ default = ["offline"]
 offline = ["dep:hound"]
 
 [dependencies]
+aec3 = { path = "../aec3" }
 nnnoiseless = { path = "../nnnoiseless" }
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }

@@ -4,6 +4,7 @@
 pub(crate) mod compressor;
 pub(crate) mod deesser;
 pub(crate) mod denoise;
+pub(crate) mod echo;
 pub(crate) mod eq;
 pub(crate) mod expander;
 pub(crate) mod gain;

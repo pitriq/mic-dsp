@@ -211,6 +211,8 @@ pub struct Report {
     /// What the chain's own meter read by the end of the file.
     pub(crate) meter_p95_dbfs: Option<f32>,
     pub(crate) meter_floor_dbfs: Option<f32>,
+    /// With a far end: the echo canceller's report.
+    pub(crate) echo: Option<super::EchoReport>,
 }
 
 impl Report {
@@ -237,12 +239,13 @@ impl Report {
             gain_db: config.gain_db(),
             meter_p95_dbfs: last.and_then(|status| status.input_speech_p95_dbfs),
             meter_floor_dbfs: last.map(|status| status.input_floor_dbfs),
+            echo: None,
         }
     }
 
-    /// Whether the output meets the targets.
+    /// Whether the output meets the targets, the echo canceller's included.
     pub fn pass(&self) -> bool {
-        self.output.pass()
+        self.output.pass() && self.echo.as_ref().is_none_or(|echo| echo.pass())
     }
 }
 
@@ -273,6 +276,9 @@ impl fmt::Display for Report {
                 "the chain's meter at the end: too little speech for a p95, floor {floor:.1} dBFS"
             )?,
             _ => {}
+        }
+        if let Some(echo) = &self.echo {
+            write!(f, "{echo}")?;
         }
         write!(f, "Targets: {}", if self.pass() { "PASS" } else { "FAIL" })
     }

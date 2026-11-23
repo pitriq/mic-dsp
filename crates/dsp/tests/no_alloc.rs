@@ -25,21 +25,45 @@ fn signal(frames: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Runs callbacks of several sizes on a thread the chain has never seen.
+/// A far end that plays for a while, stops long enough for the echo canceller to go idle,
+/// and plays again.
+fn far_end(frames: usize) -> Vec<f32> {
+    signal(frames)
+        .chunks(2)
+        .enumerate()
+        .flat_map(|(i, frame)| {
+            let playing = !(60_000..120_000).contains(&i);
+            let sample = if playing { 4.0 * frame[0] } else { 0.0 };
+            [sample, sample]
+        })
+        .collect()
+}
+
+/// Runs callbacks of several sizes on a thread the chain has never seen, with the far end's
+/// echo in the mic, then without a reference.
 fn callbacks_on_a_new_thread(mut chain: Chain) -> Chain {
     std::thread::spawn(move || {
-        let input = signal(48_000);
+        let far = far_end(150_000);
+        let mut input = signal(150_000);
+        for (i, x) in input.iter_mut().enumerate() {
+            *x += 0.3 * i.checked_sub(2 * 480).map_or(0.0, |j| far[j]);
+        }
         let mut output = vec![0.0f32; input.len()];
         let mut at = 0;
         for frames in [480, 512, 64, 1024, 0, 7, 2000].into_iter().cycle() {
             if at + 2 * frames > input.len() {
                 break;
             }
-            let (x, y) = (
+            let (x, r, y) = (
                 &input[at..at + 2 * frames],
+                &far[at..at + 2 * frames],
                 &mut output[at..at + 2 * frames],
             );
-            assert_no_alloc(|| chain.process(x, 2, y, 2));
+            if at < 2 * 130_000 {
+                assert_no_alloc(|| chain.process_with_reference(x, 2, r, 2, y, 2));
+            } else {
+                assert_no_alloc(|| chain.process(x, 2, y, 2));
+            }
             at += 2 * frames;
         }
         assert!(output.iter().any(|x| x.abs() > 0.01));

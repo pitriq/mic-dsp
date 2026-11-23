@@ -2,8 +2,8 @@
 //!
 //! The crate exposes one real-time object, [`Chain`], and one control handle, [`Control`].
 //! The stages, the input meter and the thread handoff are private. The chain order is
-//! high-pass, input meter, fixed gain, denoiser, expander, cutting EQ, compressor, presence
-//! EQ, de-esser, limiter.
+//! high-pass, echo canceller, input meter, fixed gain, denoiser, expander, cutting EQ,
+//! compressor, presence EQ, de-esser, limiter.
 //!
 //! ```
 //! let config = dsp::Config::default();
@@ -29,6 +29,7 @@ mod stages;
 
 pub use chain::{chain, Chain, Control, Status};
 pub use config::{Config, ConfigError};
+pub use stages::echo::EchoStatus;
 
 /// The only rate the chain runs at.
 pub const SAMPLE_RATE: u32 = 48_000;
