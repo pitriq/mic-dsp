@@ -226,7 +226,7 @@ mod tests {
 
         let report = process_file(&input.0, &output.0, &Config::default()).unwrap();
         assert_eq!(wav::read(&output.0).unwrap().len(), source.len());
-        assert!(report.to_string().contains("gain +2.0 dB"));
+        assert!(report.to_string().contains("gain +4.5 dB"));
         let levels = levels_file(&output.0).unwrap();
         assert!(levels.pause_windows + levels.speech_windows > 0, "{levels}");
     }

@@ -102,7 +102,7 @@ sections! {
     Highpass { hz: f32 = 75.0 }
     /// The input gain, after the high-pass. It suits one mic position and gain knob setting;
     /// micd's status line says what the target would need.
-    Gain { db: f32 = 2.0 }
+    Gain { db: f32 = 4.5 }
     Denoise { speech_wet: f32 = 0.8 }
     Expander { range_db: f32 = 12.0 }
     Cut { enabled: bool = false, hz: f32 = 250.0, gain_db: f32 = -3.0, q: f32 = 1.0 }
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn the_gain_is_its_own_setting() {
-        assert_eq!(Params::derive(&Config::default()).gain.db, 2.0);
+        assert_eq!(Params::derive(&Config::default()).gain.db, 4.5);
         for db in [-18.0, 0.0, 7.0, 24.0] {
             let config = Config::from_toml(&format!("[gain]\ndb = {db:?}")).unwrap();
             let params = Params::derive(&config);

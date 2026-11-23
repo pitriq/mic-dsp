@@ -72,7 +72,7 @@ fn process_never_allocates() {
     // And switching them off again, the gain back down.
     control.set_config(&Config::default());
     let chain = callbacks_on_a_new_thread(chain);
-    assert_eq!(control.status().gain_db, 2.0);
+    assert_eq!(control.status().gain_db, 4.5);
 
     // A gain change while callbacks run on the audio thread.
     let worker = std::thread::spawn(move || callbacks_on_a_new_thread(chain));

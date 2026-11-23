@@ -21,7 +21,7 @@ packaging/build-app.sh        # build and sign ~/Applications/mic-dsp.app
 packaging/install-agent.sh    # load the LaunchAgent
 ```
 
-`driver/uninstall.sh` and `packaging/uninstall-agent.sh` undo them. The daemon logs to `~/Library/Logs/mic-dsp/micd.log` and reads an optional `~/.config/mic-dsp/config.toml`, where `[gain] db` sets the input gain (+2 dB by default). The log's status line says what gain the measured speech needs.
+`driver/uninstall.sh` and `packaging/uninstall-agent.sh` undo them. The daemon logs to `~/Library/Logs/mic-dsp/micd.log` and reads an optional `~/.config/mic-dsp/config.toml`, where `[gain] db` sets the input gain (+4.5 dB by default). The log's status line says what gain the measured speech needs.
 
 ## Offline mode
 

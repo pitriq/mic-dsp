@@ -207,7 +207,7 @@ mod tests {
         let mut settings = Settings::new(&dir);
         let (chain, mut control) = settings.chain();
         settings.tick(&mut control);
-        assert_eq!(control.status().gain_db, 2.0);
+        assert_eq!(control.status().gain_db, 4.5);
         drop((chain, control));
         assert_eq!(fs::read_to_string(&path).unwrap(), old);
         let _ = fs::remove_dir_all(&dir);

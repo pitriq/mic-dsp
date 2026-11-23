@@ -23,12 +23,12 @@ Layout:
 
 ## DSP
 
-Chain: high-pass (75 Hz, 4th order) → input meter → fixed gain (+2 dB) → denoiser (nnnoiseless) → expander → cutting EQ (off) → compressor → presence EQ (+2 dB at 4 kHz) → de-esser (off) → limiter (−1 dBFS).
+Chain: high-pass (75 Hz, 4th order) → input meter → fixed gain (+4.5 dB) → denoiser (nnnoiseless) → expander → cutting EQ (off) → compressor → presence EQ (+2 dB at 4 kHz) → de-esser (off) → limiter (−1 dBFS).
 
 Every stage is a struct with `process(&mut self, buf: &mut [f32])` and `set_params(...)`, built with the sample rate it runs at. The DSP is hand-written apart from the denoiser.
 
 - **One output target:** the 95th percentile of 100 ms speech peaks at −11 dBFS (−12 to −10 passes), and pauses at or below −60 dBFS RMS. The compressor makeup derives from it, and the meter reports the gain the input needs to reach it.
-- **Fixed input gain:** one number in the config, +2 dB by default and −18 to +24 dB allowed, applied after the high-pass and before the denoiser. A change ramps in linearly over 30 ms. The gain never adapts. The voice detection counts the far end's voice from the speakers and loud transients such as desk thuds as speech, so an adaptive gain pumps on calls: it climbs during quiet far-end speech and the owner's next words come out hot, or a thud pulls it down for minutes. The owner talks from a fixed distance and rarely moves the knob, and the compressor and limiter handle loud moments.
+- **Fixed input gain:** one number in the config, +4.5 dB by default and −18 to +24 dB allowed, applied after the high-pass and before the denoiser. A change ramps in linearly over 30 ms. The gain never adapts. The voice detection counts the far end's voice from the speakers and loud transients such as desk thuds as speech, so an adaptive gain pumps on calls: it climbs during quiet far-end speech and the owner's next words come out hot, or a thud pulls it down for minutes. The owner talks from a fixed distance and rarely moves the knob, and the compressor and limiter handle loud moments.
 - **Input meter:** passive, for the status line only. It measures the high-passed signal before the gain, so its reading doesn't depend on the gain.
   - Speech level is a center plus a spread. A 100 ms window is speech when at least half its frames are voiced and it peaks at least 20 dB above the noise floor, which keeps out hiss the voice detection mistakes for speech. The center is the mean of the speech windows' peaks in dB: a plain mean at first, then an average over about 20 s of speech. The spread is a 95th-percentile tracker of peak minus center. There is no reading until 2 s of speech.
   - On a call the far end's voice counts as speech too, so the reading drifts toward it. It is a check on the gain, not an exact measurement.
@@ -54,7 +54,7 @@ Measured from `recordings/` (not in git), made at an earlier and quieter mic pos
 - Turning the knob down moves the speech and the floor together. The hiss comes in before the interface's gain stage, so the knob doesn't change the signal-to-noise ratio.
 - Every file is stereo with identical channels; the chain uses channel 1.
 
-The chain's voice detection puts the speech p95 of these recordings near −18 dBFS, so they need about +7 dB of gain, which puts the hiss near −60 dBFS before the denoiser and expander. The current mic position gives a speech p95 near −13 dBFS, which the default +2 dB suits.
+The chain's voice detection puts the speech p95 of these recordings near −18 dBFS, so they need about +7 dB of gain, which puts the hiss near −60 dBFS before the denoiser and expander. At the current mic position conversational speech on calls peaks near −13 dBFS (p95) and read speech near −17.5 dBFS. The default +4.5 dB puts both at the edges of the target range after the compressor.
 
 ## Not in scope
 

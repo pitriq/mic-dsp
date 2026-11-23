@@ -389,7 +389,7 @@ mod tests {
         let (mut chain, mut control) = default_chain();
         let before = control.status();
         assert!(!before.input_dead);
-        assert_eq!((before.frames, before.gain_db), (0, 2.0));
+        assert_eq!((before.frames, before.gain_db), (0, 4.5));
         assert_eq!(before.input_speech_p95_dbfs, None);
 
         let output = process(&mut chain, &[0.0; 48_000], || 480);
@@ -407,9 +407,9 @@ mod tests {
     fn a_new_config_applies_at_the_next_callback() {
         let (mut chain, mut control) = default_chain();
         process(&mut chain, &[0.0; 480], || 480);
-        assert_eq!(control.status().gain_db, 2.0);
+        assert_eq!(control.status().gain_db, 4.5);
         control.set_config(&with_gain(9.5));
-        assert_eq!(control.status().gain_db, 2.0);
+        assert_eq!(control.status().gain_db, 4.5);
         process(&mut chain, &[0.0; 64], || 64);
         assert_eq!(control.status().gain_db, 9.5);
     }
