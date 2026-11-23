@@ -6,7 +6,7 @@ A personal, always-on macOS virtual mic. The owner's SM7dB goes into a Komplete 
 
 - Memory footprint under 10 MB and flat over 24 h. Measure it with `footprint <pid>`, not RSS.
 - CPU under 1% of one core while active, about 100 µs per 10 ms frame for the whole chain, and zero while no app reads the mic.
-- No GUI and no manual calibration. The daemon survives replugging, sleep/wake and coreaudiod restarts.
+- No GUI. The input gain is one number in `config.toml`, and nothing else needs tuning. The daemon survives replugging, sleep/wake and coreaudiod restarts.
 - The audio callback does no allocation, locking, system calls, logging or I/O. Enable `assert_no_alloc` in debug builds.
   - Hand state in and out without blocking, and drop old state on the control thread.
   - Core Audio listeners only signal; all rebuilding happens on the control thread.
@@ -19,7 +19,7 @@ A personal, always-on macOS virtual mic. The owner's SM7dB goes into a Komplete 
 ## Verify
 
 - `cargo test` and `cargo clippy --all-targets`.
-- Prove a DSP change on audio: process a WAV with the offline mode and check levels, noise floor and settling time. Prove a live change by recording the virtual mic.
+- Prove a DSP change on audio: process a WAV with the offline mode and check levels and noise floor. Prove a live change by recording the virtual mic.
 
 ## Ask first
 

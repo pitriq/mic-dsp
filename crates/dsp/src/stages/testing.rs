@@ -101,7 +101,7 @@ pub(crate) const HISS_DBFS: f32 = -67.0;
 /// have a deviation near 4 dB, and their 95th percentile sits about 7 dB above their mean.
 ///
 /// `variation` scales that: 1.0 is the owner's speech, and a small value is a talker who
-/// holds one level, which shows the trim's own step response.
+/// holds one level.
 pub(crate) fn speechlike(seconds: f32, seed: u32, variation: f32) -> Speechlike {
     let mut rng = Rng::new(seed);
     let total = (seconds * 48_000.0) as usize / FRAME * FRAME;

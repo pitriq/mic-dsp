@@ -1,14 +1,13 @@
-//! micd's files in `~/.config/mic-dsp`: the config it reloads while running, the calibration
-//! state it carries between sessions (written when IO stops), and the lock that keeps a second
-//! micd out. Control thread only.
+//! micd's files in `~/.config/mic-dsp`: the config it reloads while running and the lock that
+//! keeps a second micd out. Control thread only.
 
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use dsp::{CalState, Chain, Config, Control};
+use dsp::{Chain, Config, Control};
 
 /// `~/.config/mic-dsp`, created if needed.
 pub fn dir() -> io::Result<PathBuf> {
@@ -66,18 +65,13 @@ impl Stamp {
     }
 }
 
-/// The config, the calibration state and where they live.
+/// The config and where it lives.
 pub struct Settings {
     config_path: PathBuf,
     /// The version of `config.toml` last looked at. The outer `None` means never.
     config_stamp: Option<Option<Stamp>>,
     config: Config,
-    state_path: PathBuf,
-    /// The newest calibration known, from the last chain or, before any, from the file.
-    cal: Option<CalState>,
-    /// What the state file holds, or the state the chain started from when there is no file.
-    saved: CalState,
-    /// The last failure to read the config's metadata or to write the state, logged once.
+    /// The last failure to read the config's metadata, logged once.
     error: Option<String>,
 }
 
@@ -87,42 +81,20 @@ impl Settings {
             config_path: dir.join("config.toml"),
             config_stamp: None,
             config: Config::default(),
-            state_path: dir.join("state.toml"),
-            cal: None,
-            saved: CalState::default(),
             error: None,
         }
     }
 
-    /// A chain for a new engine, with the current config and the newest calibration. The
-    /// calibration of an earlier engine in this process wins over the file, which holds the same
-    /// unless writing it failed.
+    /// A chain for a new engine, with the current config.
     pub fn chain(&mut self) -> (Chain, Control) {
         self.reload_config();
-        let cal = match self.cal {
-            Some(cal) => cal,
-            None => {
-                let cal = self.load_state();
-                self.saved = cal;
-                cal
-            }
-        };
-        self.cal = Some(cal);
-        dsp::chain(&self.config, Some(cal))
+        dsp::chain(&self.config)
     }
 
     /// The periodic work while a chain runs: applies a changed config.
     pub fn tick(&mut self, control: &mut Control) {
         if self.reload_config() {
             control.set_config(&self.config);
-        }
-    }
-
-    /// The chain's final calibration, once its engine is gone.
-    pub fn stopped(&mut self, cal: CalState) {
-        self.cal = Some(cal);
-        if cal != self.saved {
-            self.save(cal);
         }
     }
 
@@ -169,50 +141,6 @@ impl Settings {
         changed
     }
 
-    fn load_state(&mut self) -> CalState {
-        let path = self.state_path.display();
-        match fs::read_to_string(&self.state_path) {
-            Ok(text) => match CalState::from_toml(&text) {
-                Some(cal) => {
-                    log!(
-                        "restored calibration from {path}: speech p95 {:.1} dBFS, floor {:.1} dBFS",
-                        cal.speech_p95_dbfs(),
-                        cal.floor_dbfs()
-                    );
-                    return cal;
-                }
-                None => log!("{path} is not a valid state; calibration starts from the default"),
-            },
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                log!("no {path}; calibration starts from the default")
-            }
-            Err(error) => log!("cannot read {path}: {error}; calibration starts from the default"),
-        }
-        CalState::default()
-    }
-
-    /// Writes the state to a temporary file and renames it over `state.toml`, so a crash leaves
-    /// either the old state or the new one.
-    fn save(&mut self, cal: CalState) {
-        let temporary = self.state_path.with_extension("toml.tmp");
-        let written = File::create(&temporary)
-            .and_then(|mut file| {
-                file.write_all(cal.to_toml().as_bytes())?;
-                file.sync_all()
-            })
-            .and_then(|()| fs::rename(&temporary, &self.state_path));
-        match written {
-            Ok(()) => {
-                self.saved = cal;
-                self.error = None;
-            }
-            Err(error) => self.report(format!(
-                "cannot write {}: {error}",
-                self.state_path.display()
-            )),
-        }
-    }
-
     fn report(&mut self, error: String) {
         if self.error.as_ref() != Some(&error) {
             log!("{error}");
@@ -231,17 +159,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn moved(by: f32) -> CalState {
-        let base = CalState::default();
-        CalState::from_toml(&format!(
-            "version = 1\nspeech_p95_dbfs = {:?}\nspread_db = {:?}\nfloor_dbfs = {:?}\n",
-            base.speech_p95_dbfs() + by,
-            base.spread_db(),
-            base.floor_dbfs()
-        ))
-        .unwrap()
     }
 
     #[test]
@@ -282,42 +199,17 @@ mod tests {
     }
 
     #[test]
-    fn the_state_round_trips_and_memory_wins_over_the_file() {
+    fn an_old_state_file_is_left_alone() {
         let dir = scratch("state");
         let path = dir.join("state.toml");
+        let old = "version = 1\nspeech_p95_dbfs = -18.0\nspread_db = 7.0\nfloor_dbfs = -67.0\n";
+        fs::write(&path, old).unwrap();
         let mut settings = Settings::new(&dir);
-        drop(settings.chain());
-        assert_eq!(settings.cal, Some(CalState::default()));
-
-        // Nothing learned, nothing written.
-        settings.stopped(CalState::default());
-        assert!(!path.exists());
-
-        // Running writes nothing; the stop writes what was learned.
-        let (_chain, mut control) = settings.chain();
+        let (chain, mut control) = settings.chain();
         settings.tick(&mut control);
-        assert!(!path.exists());
-        settings.stopped(moved(0.25));
-        let on_disk = CalState::from_toml(&fs::read_to_string(&path).unwrap());
-        assert_eq!(on_disk, Some(moved(0.25)));
-        assert!(!dir.join("state.toml.tmp").exists());
-
-        // The next chain starts from memory even when the file says otherwise.
-        fs::write(&path, moved(-3.0).to_toml()).unwrap();
-        settings.stopped(moved(4.0));
-        fs::write(&path, moved(-3.0).to_toml()).unwrap();
-        let (_chain, mut control) = settings.chain();
-        assert_eq!(control.status().cal, moved(4.0));
-
-        // A fresh process restores the file.
-        let mut fresh = Settings::new(&dir);
-        let (_chain, mut control) = fresh.chain();
-        assert_eq!(control.status().cal, moved(-3.0));
-
-        // An invalid file means the default.
-        fs::write(&path, "version = 2\n").unwrap();
-        let (_chain, mut control) = Settings::new(&dir).chain();
-        assert_eq!(control.status().cal, CalState::default());
+        assert_eq!(control.status().gain_db, 4.5);
+        drop((chain, control));
+        assert_eq!(fs::read_to_string(&path).unwrap(), old);
         let _ = fs::remove_dir_all(&dir);
     }
 

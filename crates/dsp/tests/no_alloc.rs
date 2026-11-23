@@ -51,22 +51,34 @@ fn callbacks_on_a_new_thread(mut chain: Chain) -> Chain {
 
 #[test]
 fn process_never_allocates() {
-    let (chain, mut control) = dsp::chain(&Config::default(), None);
+    let (chain, mut control) = dsp::chain(&Config::default());
 
     // The very first callback, on a thread other than the one that built the chain.
     let chain = callbacks_on_a_new_thread(chain);
     assert!(control.status().frames > 40_000);
 
-    // Applying a new config, with every optional stage switched on.
+    // Applying a new config, with a new gain and every optional stage switched on. The gain
+    // ramps during the first callbacks.
     let config = Config::from_toml(
-        "[target]\npeak_dbfs = -14.0\n[highpass]\nhz = 90.0\n[cut]\nenabled = true\n\
-         [compressor]\nratio = 3.0\n[deesser]\nenabled = true\n[expander]\nrange_db = 15.0\n",
+        "[target]\npeak_dbfs = -14.0\n[highpass]\nhz = 90.0\n[gain]\ndb = 12.0\n\
+         [cut]\nenabled = true\n[compressor]\nratio = 3.0\n[deesser]\nenabled = true\n\
+         [expander]\nrange_db = 15.0\n",
     )
     .unwrap();
     control.set_config(&config);
     let chain = callbacks_on_a_new_thread(chain);
+    assert_eq!(control.status().gain_db, 12.0);
 
-    // And switching them off again.
+    // And switching them off again, the gain back down.
     control.set_config(&Config::default());
-    callbacks_on_a_new_thread(chain);
+    let chain = callbacks_on_a_new_thread(chain);
+    assert_eq!(control.status().gain_db, 4.5);
+
+    // A gain change while callbacks run on the audio thread.
+    let worker = std::thread::spawn(move || callbacks_on_a_new_thread(chain));
+    for db in [-6.0, 18.0, 0.0] {
+        control.set_config(&Config::from_toml(&format!("[gain]\ndb = {db:?}")).unwrap());
+        std::thread::yield_now();
+    }
+    drop(worker.join().unwrap());
 }

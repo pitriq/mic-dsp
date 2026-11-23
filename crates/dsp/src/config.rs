@@ -1,7 +1,7 @@
 //! The config file's schema, and the one place where the output target becomes numbers.
 
-use crate::cal;
-use crate::stages::{compressor, deesser, denoise, eq, expander, highpass, limiter};
+use crate::meter;
+use crate::stages::{compressor, deesser, denoise, eq, expander, gain, highpass, limiter};
 use serde::Deserialize;
 use std::fmt;
 
@@ -73,6 +73,11 @@ impl Config {
     pub(crate) fn highpass_hz(&self) -> f32 {
         self.0.highpass.hz
     }
+
+    #[cfg(feature = "offline")]
+    pub(crate) fn gain_db(&self) -> f32 {
+        self.0.gain.db
+    }
 }
 
 macro_rules! sections {
@@ -92,9 +97,12 @@ macro_rules! sections {
 }
 
 sections! {
-    /// The only level setting. Everything else that is a level derives from it.
+    /// The output level. Every other level setting derives from it.
     Target { peak_dbfs: f32 = -11.0 }
     Highpass { hz: f32 = 75.0 }
+    /// The input gain, after the high-pass. It suits one mic position and gain knob setting;
+    /// micd's status line says what the target would need.
+    Gain { db: f32 = 4.5 }
     Denoise { speech_wet: f32 = 0.8 }
     Expander { range_db: f32 = 12.0 }
     Cut { enabled: bool = false, hz: f32 = 250.0, gain_db: f32 = -3.0, q: f32 = 1.0 }
@@ -111,6 +119,7 @@ sections! {
 struct Schema {
     target: Target,
     highpass: Highpass,
+    gain: Gain,
     denoise: Denoise,
     expander: Expander,
     cut: Cut,
@@ -120,10 +129,11 @@ struct Schema {
 }
 
 impl Schema {
-    fn ranges(&self) -> [(&'static str, f32, f32, f32); 16] {
+    fn ranges(&self) -> [(&'static str, f32, f32, f32); 17] {
         [
             ("target.peak_dbfs", self.target.peak_dbfs, -24.0, -6.0),
             ("highpass.hz", self.highpass.hz, 40.0, 150.0),
+            ("gain.db", self.gain.db, -18.0, 24.0),
             ("denoise.speech_wet", self.denoise.speech_wet, 0.7, 0.85),
             ("expander.range_db", self.expander.range_db, 10.0, 15.0),
             ("cut.hz", self.cut.hz, 80.0, 1000.0),
@@ -164,7 +174,8 @@ const LIMITER_CEILING_DBFS: f32 = -1.0;
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) struct Params {
     pub highpass: highpass::Params,
-    pub cal: cal::Params,
+    pub meter: meter::Params,
+    pub gain: gain::Params,
     pub denoise: denoise::Params,
     pub expander: expander::Params,
     pub cut: eq::Params,
@@ -179,6 +190,7 @@ impl Params {
         let Schema {
             target,
             highpass,
+            gain,
             denoise,
             expander,
             cut,
@@ -188,10 +200,11 @@ impl Params {
         } = config.0;
         Params {
             highpass: highpass::Params { hz: highpass.hz },
-            // The trim puts the 95th percentile of speech peaks on the target.
-            cal: cal::Params {
+            // The meter reports the gain that would put speech peaks on the target.
+            meter: meter::Params {
                 target_dbfs: target.peak_dbfs,
             },
+            gain: gain::Params { db: gain.db },
             denoise: denoise::Params {
                 speech_wet: denoise.speech_wet,
             },
@@ -241,6 +254,7 @@ mod tests {
     fn round_trips_through_toml() {
         let mut schema = Schema::default();
         schema.target.peak_dbfs = -14.0;
+        schema.gain.db = 7.5;
         schema.cut.enabled = true;
         schema.compressor.ratio = 3.0;
         schema.deesser.hz = 7000.0;
@@ -272,6 +286,8 @@ mod tests {
         for text in [
             "[target]\npeak_dbfs = 0.0",
             "[highpass]\nhz = 10.0",
+            "[gain]\ndb = 24.5",
+            "[gain]\ndb = -18.5",
             "[denoise]\nspeech_wet = 0.5",
             "[expander]\nrange_db = 30.0",
             "[compressor]\nratio = 0.5",
@@ -289,12 +305,14 @@ mod tests {
     #[test]
     fn rejects_nonfinite_values() {
         for value in ["nan", "inf", "-inf"] {
-            let text = format!("[target]\npeak_dbfs = {value}");
-            let error = Config::from_toml(&text).unwrap_err();
-            assert!(
-                matches!(error, ConfigError::OutOfRange { .. }),
-                "{text}: {error}"
-            );
+            for key in ["[target]\npeak_dbfs", "[gain]\ndb"] {
+                let text = format!("{key} = {value}");
+                let error = Config::from_toml(&text).unwrap_err();
+                assert!(
+                    matches!(error, ConfigError::OutOfRange { .. }),
+                    "{text}: {error}"
+                );
+            }
         }
     }
 
@@ -302,6 +320,8 @@ mod tests {
     fn rejects_unknown_keys_and_wrong_types() {
         for text in [
             "[target]\npeak = -11.0",
+            "[gain]\ntrim_db = 3.0",
+            "[gain]\ndb = \"3\"",
             "[reverb]\nwet = 1.0",
             "[cut]\nenabled = 1",
             "not toml",
@@ -312,16 +332,37 @@ mod tests {
     }
 
     #[test]
+    fn the_gain_is_its_own_setting() {
+        assert_eq!(Params::derive(&Config::default()).gain.db, 4.5);
+        for db in [-18.0, 0.0, 7.0, 24.0] {
+            let config = Config::from_toml(&format!("[gain]\ndb = {db:?}")).unwrap();
+            let params = Params::derive(&config);
+            assert_eq!(params.gain.db, db);
+            // The target and what derives from it stay put.
+            assert_eq!(
+                (params.meter, params.compressor),
+                (
+                    Params::derive(&Config::default()).meter,
+                    Params::derive(&Config::default()).compressor
+                )
+            );
+        }
+        // Whole numbers are fine too.
+        let config = Config::from_toml("[gain]\ndb = 7").unwrap();
+        assert_eq!(Params::derive(&config).gain.db, 7.0);
+    }
+
+    #[test]
     fn everything_derives_from_the_one_target() {
         let params = Params::derive(&Config::default());
-        assert_eq!(params.cal.target_dbfs, -11.0);
+        assert_eq!(params.meter.target_dbfs, -11.0);
         assert_eq!(params.compressor.threshold_dbfs, -17.0);
         assert_eq!(params.compressor.makeup_db, 3.0);
         assert_eq!(params.limiter.ceiling_dbfs, -1.0);
 
         let quieter = Config::from_toml("[target]\npeak_dbfs = -15.0").unwrap();
         let params = Params::derive(&quieter);
-        assert_eq!(params.cal.target_dbfs, -15.0);
+        assert_eq!(params.meter.target_dbfs, -15.0);
         assert_eq!(params.compressor.threshold_dbfs, -21.0);
         assert_eq!(params.deesser.threshold_dbfs, -33.0);
     }
