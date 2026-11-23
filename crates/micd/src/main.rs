@@ -1,6 +1,7 @@
 //! micd: the always-on virtual mic daemon. While an app reads "Francisco's Mic", it takes the
-//! Komplete Audio 1's input, processes it and writes it to the driver's hidden feed. See
-//! `docs/design.md`.
+//! Komplete Audio 1's input, processes it and writes it to the driver's hidden feed. It also
+//! taps what the computer plays to the Komplete, which the chain's echo canceller removes from
+//! the mic. See `docs/design.md`.
 
 use std::process::ExitCode;
 
@@ -15,8 +16,10 @@ mod daemon;
 mod engine;
 mod hal;
 mod io;
+mod objc;
 mod permission;
 mod settings;
+mod tap;
 mod wake;
 
 /// Makes a debug build abort when the IOProc allocates or frees.

@@ -46,6 +46,9 @@ pub struct Stats {
     pub frames: AtomicU32,
     /// Callbacks that found no usable input or feed buffer.
     pub skipped: AtomicU64,
+    /// Callbacks that found no usable tap buffer although the aggregate carries a tap. The far
+    /// end counts as silent in them.
+    pub reference_missing: AtomicU64,
     /// Time spent in the IOProc, in `mach_absolute_time` ticks, since the control thread last
     /// took it.
     pub ticks: AtomicU64,
@@ -56,15 +59,24 @@ pub struct Stats {
     pub in_callback: AtomicBool,
 }
 
+/// Where the IOProc finds its streams in the buffer lists the HAL hands it.
+#[derive(Clone, Copy, Default)]
+pub struct Buffers {
+    /// The Komplete's first input stream, in the input list.
+    pub input: usize,
+    /// The tap of the Komplete's output, in the input list, when the aggregate carries one.
+    /// Never the buffer `input` names.
+    pub reference: Option<usize>,
+    /// The feed's output stream, in the output list.
+    pub feed: usize,
+}
+
 /// The IOProc's client data. The control thread creates it before the IOProc exists and drops it,
 /// and the chain with it, after the IOProc is stopped and destroyed.
 pub struct Context {
     /// Only the IO thread touches it.
     chain: UnsafeCell<Chain>,
-    /// Index of the buffer that carries the Komplete's first input stream.
-    input_buffer: usize,
-    /// Index of the buffer that carries the feed's output stream.
-    feed_buffer: usize,
+    buffers: Buffers,
     pub stats: Stats,
 }
 
@@ -73,13 +85,18 @@ pub struct Context {
 unsafe impl Sync for Context {}
 
 impl Context {
-    pub fn new(chain: Chain, input_buffer: usize, feed_buffer: usize) -> Box<Context> {
+    pub fn new(chain: Chain, buffers: Buffers) -> Box<Context> {
         Box::new(Context {
             chain: UnsafeCell::new(chain),
-            input_buffer,
-            feed_buffer,
+            buffers,
             stats: Stats::default(),
         })
+    }
+
+    /// Changes where the streams are. The exclusive borrow means no IOProc is registered on the
+    /// context.
+    pub fn set_buffers(&mut self, buffers: Buffers) {
+        self.buffers = buffers;
     }
 
     /// The pointer to hand to `AudioDeviceCreateIOProcID`.
@@ -87,7 +104,8 @@ impl Context {
         ptr::from_ref(self).cast_mut().cast()
     }
 
-    /// One IO cycle: Komplete channel 1 through the chain and into every feed channel.
+    /// One IO cycle: Komplete channel 1 through the chain and into every feed channel, with the
+    /// tap's first channel as the far end for the echo canceller.
     ///
     /// # Safety
     ///
@@ -97,8 +115,19 @@ impl Context {
         let started = unsafe { mach_absolute_time() };
         self.stats.in_callback.store(true, Ordering::Release);
         let chain = unsafe { &mut *self.chain.get() };
-        let source = unsafe { samples(input, self.input_buffer) };
-        let feed = unsafe { samples(output, self.feed_buffer) };
+        let source = unsafe { samples(input, self.buffers.input) };
+        let feed = unsafe { samples(output, self.buffers.feed) };
+        // Without a tap, or in a callback that has no buffer for it, the far end is silent.
+        let (reference, reference_channels): (&[f32], usize) = match self.buffers.reference {
+            None => (&[], 1),
+            Some(index) => match unsafe { samples(input, index) } {
+                Some((reference, channels)) => (reference, channels),
+                None => {
+                    self.stats.reference_missing.fetch_add(1, Ordering::Relaxed);
+                    (&[], 1)
+                }
+            },
+        };
 
         let mut frames = 0;
         match (source, feed) {
@@ -106,7 +135,14 @@ impl Context {
                 frames = (source.len() / source_channels).min(feed.len() / feed_channels);
                 let source = &source[..frames * source_channels];
                 let (feed, rest) = feed.split_at_mut(frames * feed_channels);
-                chain.process(source, source_channels, feed, feed_channels);
+                chain.process_with_reference(
+                    source,
+                    source_channels,
+                    reference,
+                    reference_channels,
+                    feed,
+                    feed_channels,
+                );
                 rest.fill(0.0);
             }
             (None, Some((feed, _))) => {
@@ -199,7 +235,12 @@ mod tests {
     #[test]
     fn the_io_proc_runs_the_chain_into_the_feed() {
         let (chain, mut control) = dsp::chain(&dsp::Config::default());
-        let context = Context::new(chain, 0, 1);
+        let buffers = Buffers {
+            input: 0,
+            reference: None,
+            feed: 1,
+        };
+        let context = Context::new(chain, buffers);
         let time = unsafe { std::mem::zeroed::<AudioTimeStamp>() };
         let mut feed = vec![7.0f32; 2 * 600];
         let mut phase = 0.0f32;
@@ -223,14 +264,7 @@ mod tests {
             };
             let mut output = List {
                 count: 2,
-                buffers: [
-                    AudioBuffer {
-                        mNumberChannels: 2,
-                        mDataByteSize: 0,
-                        mData: ptr::null_mut(),
-                    },
-                    buffer(2, &mut feed[..2 * frames]),
-                ],
+                buffers: [OFF, buffer(2, &mut feed[..2 * frames])],
             };
             let status = unsafe {
                 io_proc(
@@ -252,5 +286,90 @@ mod tests {
         assert!(last.chunks(2).all(|frame| frame[0] == frame[1]));
         assert!(last.iter().any(|&sample| sample != 0.0 && sample != 7.0));
         assert!(control.status().frames > 100_000);
+        // Without a tap the canceller only runs its first 3 s, which this test doesn't get past.
+        assert!(control.status().echo.active_frames <= 300);
+    }
+
+    const OFF: AudioBuffer = AudioBuffer {
+        mNumberChannels: 2,
+        mDataByteSize: 0,
+        mData: ptr::null_mut(),
+    };
+
+    /// The same layout with the tap as a second input stream of one channel. The canceller runs
+    /// while the tap carries sound. A callback whose tap buffer is short, empty or missing still
+    /// processes the mic, with a silent far end. A debug build aborts if any of it allocates.
+    #[test]
+    fn the_io_proc_feeds_the_tap_to_the_echo_canceller() {
+        let (chain, mut control) = dsp::chain(&dsp::Config::default());
+        let buffers = Buffers {
+            input: 0,
+            reference: Some(1),
+            feed: 1,
+        };
+        let context = Context::new(chain, buffers);
+        let time = unsafe { std::mem::zeroed::<AudioTimeStamp>() };
+        let mut feed = vec![7.0f32; 2 * 512];
+        let mut phase = 0.0f32;
+        let mut run = |tap: &mut dyn FnMut(&mut [f32]) -> AudioBuffer| {
+            let mut mic: Vec<f32> = (0..512)
+                .flat_map(|_| {
+                    phase += 0.03;
+                    [0.1 * phase.sin(), 0.9]
+                })
+                .collect();
+            let mut far: Vec<f32> = mic.chunks(2).map(|frame| 0.5 * frame[0]).collect();
+            let mut input = List {
+                count: 2,
+                buffers: [buffer(2, &mut mic), tap(&mut far)],
+            };
+            let mut output = List {
+                count: 2,
+                buffers: [OFF, buffer(2, &mut feed)],
+            };
+            let status = unsafe {
+                io_proc(
+                    0,
+                    NonNull::from(&time),
+                    NonNull::from(&mut input).cast(),
+                    NonNull::from(&time),
+                    NonNull::from(&mut output).cast(),
+                    NonNull::from(&time),
+                    context.client_data(),
+                )
+            };
+            assert_eq!(status, 0);
+        };
+        let stats = &context.stats;
+
+        for _ in 0..100 {
+            run(&mut |far| buffer(1, far));
+        }
+        let heard = control.status().echo;
+        assert!(heard.active);
+        assert!(heard.active_frames > 90, "{}", heard.active_frames);
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 0);
+
+        // Shorter than the mic's buffer, then empty: both are usable, the rest is silence.
+        run(&mut |far| buffer(1, &mut far[..100]));
+        run(&mut |far| buffer(1, &mut far[..0]));
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 0);
+
+        // No data, as for a stream that is switched off. The canceller stops once its 3 s
+        // warm-up is over and the far end has been silent for a second.
+        for _ in 0..300 {
+            run(&mut |_| OFF);
+        }
+        let silent = control.status().echo;
+        assert!(!silent.active);
+        assert!(silent.active_frames > heard.active_frames);
+        assert!(silent.active_frames <= 300, "{}", silent.active_frames);
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 300);
+
+        assert_eq!(stats.callbacks.load(Ordering::Relaxed), 402);
+        assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
+        assert!(feed.chunks(2).all(|frame| frame[0] == frame[1]));
+        assert!(feed.iter().any(|&sample| sample != 0.0 && sample != 7.0));
+        assert_eq!(control.status().frames, 402 * 512);
     }
 }

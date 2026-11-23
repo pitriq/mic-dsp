@@ -11,13 +11,13 @@ use objc2_core_audio::{
     kAudioHardwarePropertyServiceRestarted,
 };
 
-use dsp::{Control, Status};
+use dsp::{Control, EchoStatus, Status};
 
 use crate::engine::{self, Engine};
 use crate::hal::{self, ObjectId};
 use crate::permission::{self, Permission};
 use crate::settings::{self, Settings};
-use crate::{io, wake};
+use crate::{io, objc, wake};
 
 /// The interface is matched by name. Its UID carries a serial number.
 const KOMPLETE_NAME: &str = "Komplete Audio 1";
@@ -37,6 +37,10 @@ const TICK: Duration = Duration::from_secs(1);
 const IDLE_CHECK: Duration = Duration::from_secs(30);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LAST_RETRY: Duration = Duration::from_secs(8);
+/// How long starts leave out a tap that failed or stalled before they try it again.
+const TAP_RETRY: Duration = Duration::from_secs(10 * 60);
+/// Why starts leave the tap out after the IOProc of an engine with it stopped being called.
+const TAP_STALLED: &str = "the IOProc stalled with the tap";
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Devices {
@@ -93,7 +97,24 @@ struct Daemon {
     progress: (u64, Instant),
     /// The callback count at the last status line, and when that line is due again.
     status: (u64, Instant),
+    /// What the last status line saw of the echo canceller.
+    echo: EchoSeen,
+    /// Why starts leave the tap out, and since when: the tap failed, or the IOProc of an engine
+    /// with it stalled. The mic matters more than the echo canceller, so a failure that may
+    /// repeat isn't tried again on every new mic session. It is after `TAP_RETRY`, in case it
+    /// was passing, or as soon as the devices change.
+    tap_off: Option<(String, Instant)>,
     nanos_per_tick: f64,
+}
+
+/// The running totals a status line differences against the next one.
+#[derive(Clone, Copy, Default)]
+struct EchoSeen {
+    /// Sample frames the chain had consumed.
+    frames: u64,
+    status: EchoStatus,
+    /// Callbacks that had no buffer for the tap.
+    missing: u64,
 }
 
 /// The system object's listeners. They outlive every device.
@@ -118,6 +139,8 @@ impl Daemon {
             last_error: None,
             progress: (0, now),
             status: (0, now),
+            echo: EchoSeen::default(),
+            tap_off: None,
             nanos_per_tick: io::nanos_per_tick(),
         }
     }
@@ -146,6 +169,8 @@ impl Daemon {
             return false;
         }
         self.devices = found;
+        // New devices are worth another try with the tap.
+        self.tap_off = None;
         log!(
             "devices: Komplete {}, mic {}, feed {}",
             describe(found.komplete),
@@ -257,15 +282,30 @@ impl Daemon {
             return;
         };
         log!("the mic is in use; starting");
-        let (chain, control) = self.settings.chain();
-        match Engine::start(path, chain) {
+        let (chain, mut control) = self.settings.chain();
+        if self
+            .tap_off
+            .as_ref()
+            .is_some_and(|(_, since)| since.elapsed() >= TAP_RETRY)
+        {
+            self.tap_off = None;
+        }
+        let skip_tap = self.tap_off.as_ref().map(|(why, _)| why.as_str());
+        match Engine::start(path, chain, skip_tap) {
             Ok(engine) => {
                 let now = Instant::now();
+                if let Some(why) = engine.tap_failure() {
+                    self.tap_off = Some((why.to_owned(), now));
+                }
+                if let Ok(delay) = engine.reference() {
+                    control.set_echo_delay(delay);
+                }
                 self.engine = Some(engine);
                 self.control = Some(control);
                 self.input_dead = false;
                 self.progress = (0, now);
                 self.status = (0, now + STATUS_INTERVAL);
+                self.echo = EchoSeen::default();
                 self.retry = Retry::Now;
                 self.retry_delay = FIRST_RETRY;
                 self.last_error = None;
@@ -307,6 +347,10 @@ impl Daemon {
         if callbacks != self.progress.0 {
             self.progress = (callbacks, now);
         } else if now.duration_since(self.progress.1) >= STALL {
+            // The tap may be what stalls it, and the mic matters more than the echo canceller.
+            if engine.reference().is_ok() {
+                self.tap_off = Some((TAP_STALLED.to_owned(), now));
+            }
             log!(
                 "the IOProc has not run for {} s; rebuilding",
                 STALL.as_secs()
@@ -357,6 +401,13 @@ impl Daemon {
         let max_ticks = stats.max_ticks.swap(0, Ordering::Relaxed);
         let count = callbacks - self.status.0;
         self.status.0 = callbacks;
+        let seen = EchoSeen {
+            frames: status.frames,
+            status: status.echo,
+            missing: stats.reference_missing.load(Ordering::Relaxed),
+        };
+        let echo = describe_echo(engine.reference().err(), &seen, &self.echo);
+        self.echo = seen;
         let micros = |ticks: u64| ticks as f64 * self.nanos_per_tick / 1e3;
         let flags: String = [
             (status.input_dead, ", input dead"),
@@ -376,7 +427,7 @@ impl Daemon {
             "gain {:+.1} dB, {speech}, input floor {:.1} dBFS; now: vad {:.2}, \
              gain reduction {:.1} dB (compressor), {:.1} dB (limiter), output peak {:.1} dBFS{flags}; \
              {callbacks} callbacks (+{count}) of {} frames, processing mean {:.1} µs, max {:.1} µs; \
-             {:.1} s of exact-zero input, {} skipped, {} invalid samples",
+             {:.1} s of exact-zero input, {} skipped, {} invalid samples; {echo}",
             status.gain_db,
             status.input_floor_dbfs,
             status.vad,
@@ -423,6 +474,38 @@ fn describe(device: Option<ObjectId>) -> String {
     device.map_or("missing".into(), |id| id.to_string())
 }
 
+/// The echo canceller's part of the status line: what it did between `earlier` and `now`.
+/// `off` is why the chain gets no far end, if it gets none.
+fn describe_echo(off: Option<&str>, now: &EchoSeen, earlier: &EchoSeen) -> String {
+    if let Some(why) = off {
+        return format!("echo canceller off ({why})");
+    }
+    let echo = &now.status;
+    let active = echo
+        .active_frames
+        .saturating_sub(earlier.status.active_frames);
+    let mut line = if active == 0 {
+        "echo canceller idle".to_owned()
+    } else {
+        let frames = now.frames.saturating_sub(earlier.frames).max(1);
+        let share = (100.0 * (active * dsp::FRAME as u64) as f64 / frames as f64).min(100.0);
+        let removed = match echo.removed_db_since(&earlier.status) {
+            Some(db) => format!("removed {db:.1} dB in far-end-only frames"),
+            None => "no far-end-only frames".to_owned(),
+        };
+        format!(
+            "echo canceller active {share:.0}% of the time, {removed}, ERLE {:.1} dB, \
+             echo path at {:.0} ms after the reference",
+            echo.erle_db, echo.echo_delay_ms
+        )
+    };
+    let missing = now.missing.saturating_sub(earlier.missing);
+    if missing > 0 {
+        line += &format!(", no tap buffer in {missing} callbacks");
+    }
+    line
+}
+
 pub fn run() -> ExitCode {
     let dir = match settings::dir() {
         Ok(dir) => dir,
@@ -455,13 +538,19 @@ pub fn run() -> ExitCode {
     }
     let mut daemon = Daemon::new(Settings::new(&dir));
     daemon.listen_to_system();
-    daemon.refresh_devices();
-    daemon.reconcile();
+    {
+        let _pool = objc::Pool::new();
+        daemon.refresh_devices();
+        daemon.reconcile();
+    }
     loop {
         let wake = wake::wait(daemon.timeout());
         if wake.quit {
             break;
         }
+        // The tap's API is Objective-C underneath. Whatever it autoreleases while the daemon
+        // works goes with this pool, since nothing else drains the control thread.
+        let _pool = objc::Pool::new();
         daemon.handle(wake.events);
         daemon.reconcile();
         daemon.tick();
@@ -504,5 +593,59 @@ pub fn probe() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(frames: u64, active_frames: u64, far: (u64, f64, f64), missing: u64) -> EchoSeen {
+        EchoSeen {
+            frames,
+            status: EchoStatus {
+                active: active_frames > 0,
+                active_frames,
+                far_frames: far.0,
+                far_in: far.1,
+                far_out: far.2,
+                erle_db: 18.26,
+                echo_delay_ms: 4.0,
+            },
+            missing,
+        }
+    }
+
+    #[test]
+    fn the_status_line_says_what_the_echo_canceller_did_since_the_last_one() {
+        let start = EchoSeen::default();
+        let quiet = seen(2_880_000, 0, (0, 0.0, 0.0), 0);
+        assert_eq!(describe_echo(None, &quiet, &start), "echo canceller idle");
+        assert_eq!(
+            describe_echo(Some("the IOProc never ran with the tap"), &quiet, &start),
+            "echo canceller off (the IOProc never ran with the tap)"
+        );
+
+        // A minute later: 15 s of far end, with 20 dB less energy out than in while only the
+        // far end spoke.
+        let call = seen(5_760_000, 1_500, (900, 50.0, 0.5), 0);
+        assert_eq!(
+            describe_echo(None, &call, &quiet),
+            "echo canceller active 25% of the time, removed 20.0 dB in far-end-only frames, \
+             ERLE 18.3 dB, echo path at 4 ms after the reference"
+        );
+
+        // Active with the owner talking over the far end throughout, then nothing new.
+        let double = seen(8_640_000, 2_100, (900, 50.0, 0.5), 0);
+        assert_eq!(
+            describe_echo(None, &double, &call),
+            "echo canceller active 10% of the time, no far-end-only frames, ERLE 18.3 dB, \
+             echo path at 4 ms after the reference"
+        );
+        let after = seen(11_520_000, 2_100, (900, 50.0, 0.5), 7);
+        assert_eq!(
+            describe_echo(None, &after, &double),
+            "echo canceller idle, no tap buffer in 7 callbacks"
+        );
     }
 }
