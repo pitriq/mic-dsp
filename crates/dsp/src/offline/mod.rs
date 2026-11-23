@@ -7,7 +7,7 @@ mod wav;
 pub use report::{Levels, Report};
 
 use crate::stages::testing;
-use crate::{CalState, Chain, Config, Status, FRAME};
+use crate::{Chain, Config, Status, FRAME};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -39,14 +39,9 @@ impl std::error::Error for Error {}
 /// Runs channel 1 of a 48 kHz WAV through the chain and writes the result as 24-bit stereo,
 /// the same length as the source and aligned with it. The report checks the result against
 /// the targets.
-pub fn process_file(
-    input: &Path,
-    output: &Path,
-    config: &Config,
-    restored: Option<CalState>,
-) -> Result<Report, Error> {
+pub fn process_file(input: &Path, output: &Path, config: &Config) -> Result<Report, Error> {
     let source = wav::read(input)?;
-    let (processed, trace) = run(&source, config, restored);
+    let (processed, trace) = run(&source, config);
     wav::write(output, &processed)?;
     Ok(Report::new(&source, &processed, &trace, config))
 }
@@ -60,8 +55,8 @@ pub fn levels_file(path: &Path) -> Result<Levels, Error> {
 /// The chain over `source` in 10 ms callbacks, with one status per whole source frame. The
 /// chain's latency is taken off the front and drained at the end with zeros, so the output
 /// lines up with the source.
-fn run(source: &[f32], config: &Config, restored: Option<CalState>) -> (Vec<f32>, Vec<Status>) {
-    let (mut chain, mut control) = crate::chain(config, restored);
+fn run(source: &[f32], config: &Config) -> (Vec<f32>, Vec<Status>) {
+    let (mut chain, mut control) = crate::chain(config);
     let mut padded = source.to_vec();
     padded.resize(source.len() + Chain::LATENCY, 0.0);
     let mut output = vec![0.0; padded.len()];
@@ -96,7 +91,7 @@ pub fn bench(input: Option<&Path>) -> Result<Bench, Error> {
     };
     let stereo: Vec<f32> = mono.iter().flat_map(|x| [*x, *x]).collect();
     let mut out = [0.0f32; 2 * FRAME];
-    let (mut chain, _control) = crate::chain(&Config::default(), None);
+    let (mut chain, _control) = crate::chain(&Config::default());
     let mut micros: Vec<f64> = stereo
         .chunks_exact(2 * FRAME)
         .map(|block| {
@@ -162,7 +157,7 @@ mod tests {
     fn output_keeps_the_source_length_and_one_status_per_whole_frame() {
         for samples in [0, 1, FRAME - 1, FRAME, 10 * FRAME + 123] {
             let source = noise(samples, 0.01, 1);
-            let (output, trace) = run(&source, &Config::default(), None);
+            let (output, trace) = run(&source, &Config::default());
             assert_eq!(output.len(), samples);
             assert_eq!(trace.len(), samples / FRAME);
         }
@@ -173,7 +168,7 @@ mod tests {
         // Speech that starts 2 s in must start 2 s into the output.
         let mut source = noise(2 * 48_000, db_to_lin(HISS_DBFS), 1);
         source.extend(speechlike(4.0, 2, 0.3).samples);
-        let (output, _) = run(&source, &Config::default(), None);
+        let (output, _) = run(&source, &Config::default());
         let loud = |signal: &[f32]| signal.iter().position(|x| x.abs() > 0.01).unwrap() as i64;
         assert!(
             (loud(&output) - loud(&source)).abs() < 4800,
@@ -183,59 +178,41 @@ mod tests {
         );
     }
 
-    /// Two stretches of speech around 4 s of hiss, with the knob turned 13 dB down in the
-    /// middle of the hiss: the owner's knob test in miniature.
-    fn knob_step() -> Vec<f32> {
-        let hiss = db_to_lin(HISS_DBFS) * 3f32.sqrt();
-        let mut source = speechlike(20.0, 1, 0.3).samples;
-        source.extend(noise(4 * 48_000, hiss, 2));
-        source.extend(speechlike(16.0, 3, 0.3).samples);
-        let step = 22 * 48_000;
-        for x in &mut source[step..] {
-            *x *= db_to_lin(-13.0);
-        }
-        source
-    }
-
     #[test]
-    fn report_finds_a_knob_step_and_times_the_trim() {
-        let source = knob_step();
-        let (output, trace) = run(&source, &Config::default(), None);
-        let report = Report::new(&source, &output, &trace, &Config::default());
-
-        let [step] = report.steps[..] else {
-            panic!("{report}")
-        };
-        assert!((step.delta_db + 13.0).abs() < 1.0, "{report}");
+    fn a_gain_that_suits_the_input_meets_the_targets() {
+        // Synthetic speech with its p95 at -18 dBFS, over -67 dBFS hiss: +7 dB is right.
+        let source = speechlike(40.0, 1, 1.0).samples;
+        let config = Config::from_toml("[gain]\ndb = 7.0").unwrap();
+        let (output, trace) = run(&source, &config);
+        let report = Report::new(&source, &output, &trace, &config);
         assert!(
-            (step.at_s - 22.0).abs() <= 0.2 && step.uncertain_s <= 0.2,
+            (report.output.speech_p95_dbfs + 11.0).abs() <= 1.0,
             "{report}"
         );
-        assert!(step.speech_delta_db.unwrap() < -6.0, "{report}");
-        // Speech resumes after 24 s, and the trim has 13 dB to make up.
-        assert!(
-            (step.first_speech_s.unwrap() - 24.4).abs() < 0.5,
-            "{report}"
-        );
-        assert!(
-            step.settled_trim_db.unwrap() > report.trim_range_db.0 + 9.0,
-            "{report}"
-        );
-        assert!(step.settle_s.unwrap() < 6.0, "{report}");
-
         assert!(
             report.output.pause_windows > 0 && report.output.pause_rms_dbfs <= -60.0,
             "{report}"
         );
+        assert!(report.pass(), "{report}");
+        let text = report.to_string();
         assert!(
-            (report.output.speech_p95_dbfs + 11.0).abs() < 2.5,
+            text.contains("gain +7.0 dB; the input's speech p95 needs"),
+            "{text}"
+        );
+        assert!(text.ends_with("Targets: PASS"), "{text}");
+        // The chain's meter agrees with the report's own measurement of the input.
+        let meter = report.meter_p95_dbfs.unwrap();
+        assert!(
+            (meter - report.input.speech_p95_dbfs).abs() < 1.5,
             "{report}"
         );
-        assert!(report.to_string().ends_with(if report.pass() {
-            "Targets: PASS"
-        } else {
-            "Targets: FAIL"
-        }));
+
+        // The same speech 10 dB quieter misses the target, and the report says by how much.
+        let quiet: Vec<f32> = source.iter().map(|x| x * db_to_lin(-10.0)).collect();
+        let (output, trace) = run(&quiet, &config);
+        let report = Report::new(&quiet, &output, &trace, &config);
+        assert!(!report.pass(), "{report}");
+        assert!(report.to_string().ends_with("Targets: FAIL"));
     }
 
     #[test]
@@ -247,9 +224,9 @@ mod tests {
         assert_eq!(read.len(), source.len());
         assert!(read.iter().zip(&source).all(|(a, b)| (a - b).abs() < 1e-6));
 
-        let report = process_file(&input.0, &output.0, &Config::default(), None).unwrap();
+        let report = process_file(&input.0, &output.0, &Config::default()).unwrap();
         assert_eq!(wav::read(&output.0).unwrap().len(), source.len());
-        assert!(report.to_string().contains("trim: starts"));
+        assert!(report.to_string().contains("gain +2.0 dB"));
         let levels = levels_file(&output.0).unwrap();
         assert!(levels.pause_windows + levels.speech_windows > 0, "{levels}");
     }

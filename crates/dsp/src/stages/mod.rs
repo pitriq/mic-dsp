@@ -6,6 +6,7 @@ pub(crate) mod deesser;
 pub(crate) mod denoise;
 pub(crate) mod eq;
 pub(crate) mod expander;
+pub(crate) mod gain;
 pub(crate) mod highpass;
 pub(crate) mod limiter;
 #[cfg(any(test, feature = "offline"))]

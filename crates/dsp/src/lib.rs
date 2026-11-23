@@ -1,13 +1,13 @@
 //! The mic-dsp vocal chain, with no platform dependencies.
 //!
 //! The crate exposes one real-time object, [`Chain`], and one control handle, [`Control`].
-//! The stages, the calibration and the thread handoff are private. The chain order is
-//! high-pass, level measurement, trim, denoiser, expander, cutting EQ, compressor, presence
+//! The stages, the input meter and the thread handoff are private. The chain order is
+//! high-pass, input meter, fixed gain, denoiser, expander, cutting EQ, compressor, presence
 //! EQ, de-esser, limiter.
 //!
 //! ```
 //! let config = dsp::Config::default();
-//! let (mut chain, mut control) = dsp::chain(&config, None);
+//! let (mut chain, mut control) = dsp::chain(&config);
 //!
 //! // Audio thread: any callback size, interleaved in and out.
 //! let (mic, mut feed) = ([0.0f32; 2 * 512], [0.0f32; 2 * 512]);
@@ -19,15 +19,14 @@
 //! assert_eq!(status.frames, 512);
 //! ```
 
-mod cal;
 mod chain;
 mod config;
 mod handoff;
+mod meter;
 #[cfg(feature = "offline")]
 pub mod offline;
 mod stages;
 
-pub use cal::CalState;
 pub use chain::{chain, Chain, Control, Status};
 pub use config::{Config, ConfigError};
 

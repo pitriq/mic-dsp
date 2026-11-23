@@ -289,16 +289,9 @@ impl Daemon {
             // Dropping the engine stops IO and destroys the IOProc and the aggregate, then frees
             // the chain.
             self.engine = None;
-            self.release_chain();
+            self.control = None;
             self.hold_until = None;
             log!("stopped");
-        }
-    }
-
-    /// Keeps the calibration of the chain that just went away, in memory and on disk.
-    fn release_chain(&mut self) {
-        if let Some(mut control) = self.control.take() {
-            self.settings.stopped(control.status().cal);
         }
     }
 
@@ -346,14 +339,10 @@ impl Daemon {
             return;
         }
         match permission::microphone() {
-            Permission::Authorized => log!(
-                "the input is exact zeros: the Komplete is unplugged or silent; calibration is \
-                 frozen"
-            ),
-            permission => log!(
-                "the input is exact zeros: microphone permission is {permission}; calibration \
-                 is frozen"
-            ),
+            Permission::Authorized => {
+                log!("the input is exact zeros: the Komplete is unplugged or silent")
+            }
+            permission => log!("the input is exact zeros: microphone permission is {permission}"),
         }
     }
 
@@ -372,20 +361,24 @@ impl Daemon {
         let flags: String = [
             (status.input_dead, ", input dead"),
             (status.clipping, ", clipping"),
-            (status.rapid, ", trim slewing fast"),
         ]
         .iter()
         .filter(|(on, _)| *on)
         .map(|(_, flag)| *flag)
         .collect();
+        let speech = match (status.input_speech_p95_dbfs, status.gain_to_target_db) {
+            (Some(p95), Some(needed)) => {
+                format!("input speech p95 {p95:.1} dBFS (the target needs {needed:+.1} dB)")
+            }
+            _ => "input speech p95 not measured yet".to_owned(),
+        };
         log!(
-            "trim {:+.1} dB, input speech p95 {:.1} dBFS, input floor {:.1} dBFS; now: vad {:.2}, \
+            "gain {:+.1} dB, {speech}, input floor {:.1} dBFS; now: vad {:.2}, \
              gain reduction {:.1} dB (compressor), {:.1} dB (limiter), output peak {:.1} dBFS{flags}; \
              {callbacks} callbacks (+{count}) of {} frames, processing mean {:.1} µs, max {:.1} µs; \
              {:.1} s of exact-zero input, {} skipped, {} invalid samples",
-            status.trim_db,
-            status.cal.speech_p95_dbfs(),
-            status.cal.floor_dbfs(),
+            status.gain_db,
+            status.input_floor_dbfs,
             status.vad,
             status.comp_gr_db.abs(),
             status.limiter_gr_db.abs(),

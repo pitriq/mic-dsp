@@ -1,14 +1,15 @@
 //! The real-time object and its control handle: stage order, re-blocking, latency, applying
 //! parameters and publishing status.
 
-use crate::cal::{CalState, Calibration};
 use crate::config::{Config, Params};
 use crate::handoff::{self, Rx, Tx};
+use crate::meter::Meter;
 use crate::stages::compressor::Compressor;
 use crate::stages::deesser::Deesser;
 use crate::stages::denoise::{self, Denoise};
 use crate::stages::eq::Eq;
 use crate::stages::expander::Expander;
+use crate::stages::gain::Gain;
 use crate::stages::highpass::Highpass;
 use crate::stages::limiter::{self, Limiter};
 use crate::stages::{lin_to_db, Stage};
@@ -16,12 +17,11 @@ use crate::{FRAME, SAMPLE_RATE};
 
 /// Builds the chain and its control handle. It allocates everything the chain will ever
 /// need and primes nnnoiseless's shared tables on the calling thread, so the first audio
-/// callback does no first-use work. `restored` is the state saved by an earlier session;
-/// without it calibration starts from the owner's baseline.
-pub fn chain(config: &Config, restored: Option<CalState>) -> (Chain, Control) {
+/// callback does no first-use work.
+pub fn chain(config: &Config) -> (Chain, Control) {
     denoise::prime();
     let params = Params::derive(config);
-    let core = Core::new(params, restored.unwrap_or_default());
+    let core = Core::new(params);
     let (params_tx, params_rx) = handoff::latest(params);
     let (status_tx, status_rx) = handoff::latest(core.status());
     (
@@ -55,19 +55,20 @@ pub struct Control {
 pub struct Status {
     /// Sample frames consumed since the chain was built.
     pub frames: u64,
-    /// What calibration has learned. Worth persisting.
-    pub cal: CalState,
-    pub trim_db: f32,
+    /// The input gain from the config. A change ramps in over 30 ms.
+    pub gain_db: f32,
+    /// The input meter, before the gain: the 95th percentile of 100 ms speech peaks, once
+    /// there were 2 s of speech, and the RMS of the pauses.
+    pub input_speech_p95_dbfs: Option<f32>,
+    pub input_floor_dbfs: f32,
+    /// The gain that would put the measured speech percentile on the target.
+    pub gain_to_target_db: Option<f32>,
     /// Voice probability of the latest frame, 0 to 1.
     pub vad: f32,
-    /// Whether the latest frame counted as speech for calibration.
-    pub speech: bool,
-    /// The trim is slewing fast because its error stayed large.
-    pub rapid: bool,
-    /// At least 100 ms of exact zeros: unplugged, or mic permission denied. Adaptation is
-    /// frozen meanwhile.
+    /// At least 100 ms of exact zeros: unplugged, or mic permission denied. The meter ignores
+    /// them.
     pub input_dead: bool,
-    /// The raw input clipped within the last 2 s, so boosts are blocked.
+    /// The raw input clipped within the last 2 s.
     pub clipping: bool,
     /// Largest gain reduction in the latest frame.
     pub comp_gr_db: f32,
@@ -136,7 +137,8 @@ impl Control {
 
 struct Core {
     highpass: Highpass,
-    cal: Calibration,
+    meter: Meter,
+    gain: Gain,
     denoise: Denoise,
     expander: Expander,
     cut: Eq,
@@ -157,11 +159,12 @@ struct Core {
 }
 
 impl Core {
-    fn new(params: Params, restored: CalState) -> Core {
+    fn new(params: Params) -> Core {
         let rate = SAMPLE_RATE as f32;
         Core {
             highpass: Highpass::new(rate, params.highpass),
-            cal: Calibration::new(rate, params.cal, restored),
+            meter: Meter::new(rate, params.meter),
+            gain: Gain::new(rate, params.gain),
             denoise: Denoise::new(rate, params.denoise),
             expander: Expander::new(rate, params.expander),
             cut: Eq::new(rate, params.cut),
@@ -182,7 +185,8 @@ impl Core {
     fn apply(&mut self, params: Params) {
         let Params {
             highpass,
-            cal,
+            meter,
+            gain,
             denoise,
             expander,
             cut,
@@ -192,7 +196,8 @@ impl Core {
             limiter,
         } = params;
         self.highpass.set_params(highpass);
-        self.cal.set_params(cal);
+        self.meter.set_params(meter);
+        self.gain.set_params(gain);
         self.denoise.set_params(denoise);
         self.expander.set_params(expander);
         self.cut.set_params(cut);
@@ -229,14 +234,15 @@ impl Core {
 
     fn frame(&mut self) {
         let x = &mut self.block;
-        self.cal.inspect_raw(x);
+        self.meter.inspect_raw(x);
         self.highpass.process(x);
-        self.cal.process(x);
+        self.meter.measure(x);
+        self.gain.process(x);
         self.denoise.process(x);
         // The voice detection of this frame qualifies this frame's level, and leads the
         // denoiser's delayed audio by a frame, which gives the expander time to open.
         let voice = self.denoise.voice();
-        self.cal.adapt(voice);
+        self.meter.update(voice);
         self.expander.key(voice.speech);
         self.expander.process(x);
         self.cut.process(x);
@@ -252,17 +258,17 @@ impl Core {
     fn status(&self) -> Status {
         Status {
             frames: self.frames,
-            cal: self.cal.state(),
-            trim_db: self.cal.trim_db(),
+            gain_db: self.gain.db(),
+            input_speech_p95_dbfs: self.meter.speech_p95_dbfs(),
+            input_floor_dbfs: self.meter.floor_dbfs(),
+            gain_to_target_db: self.meter.gain_to_target_db(),
             vad: self.vad,
-            speech: self.cal.speech(),
-            rapid: self.cal.rapid(),
-            input_dead: self.cal.input_dead(),
-            clipping: self.cal.clipping(),
+            input_dead: self.meter.input_dead(),
+            clipping: self.meter.clipping(),
             comp_gr_db: self.compressor.reduction_db(),
             limiter_gr_db: self.limiter.reduction_db(),
             out_peak_dbfs: lin_to_db(self.out_peak),
-            zero_frames_total: self.cal.zero_frames(),
+            zero_frames_total: self.meter.zero_frames(),
             invalid_samples: self.invalid_samples,
         }
     }
@@ -272,7 +278,7 @@ impl Core {
 mod tests {
     use super::*;
     use crate::stages::db_to_lin;
-    use crate::stages::testing::{noise, speechlike, Rng};
+    use crate::stages::testing::{noise, sine, speechlike, Rng};
 
     /// Mono in, mono out, cut into callbacks of the sizes given, repeating the last.
     fn process(chain: &mut Chain, input: &[f32], mut sizes: impl FnMut() -> usize) -> Vec<f32> {
@@ -287,7 +293,16 @@ mod tests {
     }
 
     fn default_chain() -> (Chain, Control) {
-        chain(&Config::default(), None)
+        chain(&Config::default())
+    }
+
+    fn with_gain(db: f32) -> Config {
+        Config::from_toml(&format!("[gain]\ndb = {db:?}")).unwrap()
+    }
+
+    fn rms_db(signal: &[f32]) -> f32 {
+        let mean = signal.iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / signal.len() as f64;
+        lin_to_db(mean.sqrt() as f32)
     }
 
     #[test]
@@ -374,7 +389,8 @@ mod tests {
         let (mut chain, mut control) = default_chain();
         let before = control.status();
         assert!(!before.input_dead);
-        assert_eq!((before.frames, before.trim_db), (0, 7.0));
+        assert_eq!((before.frames, before.gain_db), (0, 2.0));
+        assert_eq!(before.input_speech_p95_dbfs, None);
 
         let output = process(&mut chain, &[0.0; 48_000], || 480);
         assert!(output.iter().all(|x| *x == 0.0));
@@ -382,38 +398,83 @@ mod tests {
         assert!(status.input_dead);
         assert_eq!(status.frames, 48_000);
         assert_eq!(status.zero_frames_total, 100);
-        // Nothing was learned from it.
-        assert_eq!(status.cal, before.cal);
-        assert_eq!(status.trim_db, before.trim_db);
-    }
-
-    #[test]
-    fn the_first_status_carries_the_restored_state() {
-        let text = "version = 1\nspeech_p95_dbfs = -30.0\nspread_db = 8.0\nfloor_dbfs = -75.0\n";
-        let restored = CalState::from_toml(text).unwrap();
-        let (_chain, mut control) = chain(&Config::default(), Some(restored));
-        let status = control.status();
-        assert_eq!(status.cal, restored);
-        assert_eq!(status.trim_db, 19.0);
+        // Nothing was measured from it.
+        assert_eq!(status.input_speech_p95_dbfs, None);
+        assert_eq!(status.input_floor_dbfs, before.input_floor_dbfs);
     }
 
     #[test]
     fn a_new_config_applies_at_the_next_callback() {
         let (mut chain, mut control) = default_chain();
         process(&mut chain, &[0.0; 480], || 480);
-        let before = control.status().cal.speech_p95_dbfs();
-
-        // The trim reference follows the target: the same trim now stands for a level
-        // 4 dB lower.
-        control.set_config(&Config::from_toml("[target]\npeak_dbfs = -15.0").unwrap());
-        assert_eq!(control.status().cal.speech_p95_dbfs(), before);
+        assert_eq!(control.status().gain_db, 2.0);
+        control.set_config(&with_gain(9.5));
+        assert_eq!(control.status().gain_db, 2.0);
         process(&mut chain, &[0.0; 64], || 64);
-        assert_eq!(control.status().cal.speech_p95_dbfs(), before - 4.0);
+        assert_eq!(control.status().gain_db, 9.5);
+    }
+
+    #[test]
+    fn the_gain_moves_quiet_speech_by_its_own_amount() {
+        // 20 dB under the owner's level, so the compressor and the limiter stay out of it.
+        let input: Vec<f32> = speechlike(20.0, 7, 1.0)
+            .samples
+            .iter()
+            .map(|x| x * db_to_lin(-20.0))
+            .collect();
+        let level = |db: f32| {
+            let output = process(&mut chain(&with_gain(db)).0, &input, || 480);
+            rms_db(&output[48_000..])
+        };
+        let base = level(0.0);
+        for db in [6.0, 12.0] {
+            let moved = level(db) - base;
+            assert!(
+                (moved - db).abs() < 1.0,
+                "+{db} dB moved the output {moved} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn the_meter_reads_the_input_before_the_gain() {
+        let input = speechlike(30.0, 8, 1.0).samples;
+        let measure = |db: f32| {
+            let (mut chain, mut control) = chain(&with_gain(db));
+            process(&mut chain, &input, || 480);
+            control.status()
+        };
+        let (plain, boosted) = (measure(0.0), measure(10.0));
+        let (a, b) = (
+            plain.input_speech_p95_dbfs.unwrap(),
+            boosted.input_speech_p95_dbfs.unwrap(),
+        );
+        assert!((a - b).abs() < 1.0, "{a} vs {b}");
+        assert!((plain.input_floor_dbfs - boosted.input_floor_dbfs).abs() < 1.0);
+        assert_eq!(boosted.gain_to_target_db, Some(-11.0 - b));
+    }
+
+    #[test]
+    fn a_gain_change_mid_stream_ramps_without_a_jump() {
+        // A steady 1 kHz tone, quiet enough for the compressor, under each config change.
+        let tone = sine(4 * 48_000, 1000.0, 0.003);
+        let (mut chain, mut control) = default_chain();
+        let mut output = process(&mut chain, &tone[..2 * 48_000], || 480);
+        control.set_config(&with_gain(14.0));
+        output.extend(process(&mut chain, &tone[2 * 48_000..], || 512));
+        let jump = output
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0f32, f32::max);
+        // The largest step a 1 kHz tone at the output level takes between two samples.
+        let peak = output.iter().fold(0.0f32, |peak, x| peak.max(x.abs()));
+        let slope = peak * (std::f32::consts::TAU * 1000.0 / 48_000.0);
+        assert!(jump <= slope * 1.1, "jumped {jump}, the tone moves {slope}");
     }
 
     #[test]
     fn the_output_never_exceeds_the_ceiling() {
-        // Full-scale bursts over hiss, far hotter than the trim expects.
+        // Full-scale bursts over hiss.
         let mut rng = Rng::new(5);
         let mut input = noise(96_000, 0.001, 6);
         for burst in input.chunks_mut(4800).step_by(3) {

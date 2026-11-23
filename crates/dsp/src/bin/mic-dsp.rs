@@ -1,13 +1,13 @@
 //! The offline CLI: process a recording through the chain, check a recording's levels
 //! against the targets, or benchmark the chain.
 
-use dsp::{offline, CalState, Config};
+use dsp::{offline, Config};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
 usage:
-  mic-dsp process <in.wav> <out.wav> [--config <config.toml>] [--state <state.toml>]
+  mic-dsp process <in.wav> <out.wav> [--config <config.toml>]
       Runs channel 1 of a 48 kHz WAV through the chain and reports against the targets.
   mic-dsp levels <file.wav>
       Reports the levels of any 48 kHz recording against the targets.
@@ -33,23 +33,14 @@ fn run(args: &[String]) -> Result<bool, String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     match args.as_slice() {
         ["process", input, output, options @ ..] => {
-            let (mut config, mut state) = (Config::default(), None);
-            for option in options.chunks(2) {
-                match option {
-                    ["--config", path] => {
-                        config =
-                            Config::from_toml(&read(path)?).map_err(|e| format!("{path}: {e}"))?;
-                    }
-                    ["--state", path] => {
-                        state = Some(
-                            CalState::from_toml(&read(path)?)
-                                .ok_or(format!("{path}: not a calibration state"))?,
-                        );
-                    }
-                    _ => return Err(USAGE.to_owned()),
+            let config = match options {
+                [] => Config::default(),
+                ["--config", path] => {
+                    Config::from_toml(&read(path)?).map_err(|e| format!("{path}: {e}"))?
                 }
-            }
-            let report = offline::process_file(Path::new(input), Path::new(output), &config, state)
+                _ => return Err(USAGE.to_owned()),
+            };
+            let report = offline::process_file(Path::new(input), Path::new(output), &config)
                 .map_err(|e| e.to_string())?;
             println!("{report}");
             Ok(report.pass())

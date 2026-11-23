@@ -198,7 +198,7 @@ mod tests {
     /// callback allocates, because micd's global allocator is `AllocDisabler`.
     #[test]
     fn the_io_proc_runs_the_chain_into_the_feed() {
-        let (chain, mut control) = dsp::chain(&dsp::Config::default(), None);
+        let (chain, mut control) = dsp::chain(&dsp::Config::default());
         let context = Context::new(chain, 0, 1);
         let time = unsafe { std::mem::zeroed::<AudioTimeStamp>() };
         let mut feed = vec![7.0f32; 2 * 600];

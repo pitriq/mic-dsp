@@ -3,7 +3,7 @@ name = "dsp"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
-description = "The mic-dsp vocal chain: stages, calibration and the offline WAV mode. No platform dependencies."
+description = "The mic-dsp vocal chain: stages, the input meter and the offline WAV mode. No platform dependencies."
 publish = false
 
 [features]
