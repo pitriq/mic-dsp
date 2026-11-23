@@ -1,0 +1,16 @@
+[package]
+name = "aec3"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license = "BSD-3-Clause"
+description = "WebRTC's AEC3 echo canceller ported to Rust: mono, 48 kHz, one reference channel, fixed echo delay"
+publish = false
+
+[dependencies]
+realfft = "3.5"
+
+[dev-dependencies]
+# tests/no_alloc.rs runs the canceller inside assert_no_alloc. Without the default features the
+# check also stays on in release test builds of this package.
+assert_no_alloc = { version = "1.1", default-features = false }
