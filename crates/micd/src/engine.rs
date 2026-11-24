@@ -46,7 +46,8 @@ const IO_CYCLE_USAGE: f32 = 0.5;
 
 /// Why the chain gets no far end when the loopback's driver is missing.
 const NOT_INSTALLED: &str = "Francisco's Speakers is not installed";
-/// And when the aggregate with the loopback did not confirm the order of its streams.
+/// Why the aggregate with the loopback is given up when it did not confirm the order of its
+/// streams.
 const ORDER_UNCONFIRMED: &str = "the order of the aggregate's streams is unconfirmed";
 
 /// Only `release` takes the context out of an engine, and nothing uses the engine after it.
@@ -93,7 +94,7 @@ pub struct Engine {
     path: Path,
     /// The earliest the echo follows the reference, in frames, or why the chain gets no
     /// reference.
-    far_end: Result<u32, &'static str>,
+    far_end: Result<u32, String>,
     /// `None` until the IOProc is created.
     io_proc: AudioDeviceIOProcID,
     running: bool,
@@ -109,22 +110,31 @@ pub struct Engine {
 impl Engine {
     /// Builds the aggregate and starts IO through `chain`. The chain comes back from `stop`,
     /// and from a start that failed.
+    ///
+    /// The mic matters more than the echo canceller, so the engine runs without the loopback
+    /// rather than not at all. `skip_loopback` is the daemon's reason to leave it out. A
+    /// loopback the engine can't read is left out too, and when the aggregate with it fails to
+    /// build or to start, one of the Komplete and the feed alone replaces it.
     pub fn start(
         path: Path,
         chain: Box<Chain>,
         capture: Option<Box<Capture>>,
+        skip_loopback: Option<&str>,
     ) -> Result<Engine, Failed> {
-        let plan = match Plan::read(path) {
+        let plan = match Plan::read(path, skip_loopback) {
             Ok(plan) => plan,
             Err(error) => {
                 let chain = Some(chain);
                 return Err(Failed { error, chain });
             }
         };
+        if let (Some(_), Err(why)) = (path.loopback, &plan.loopback) {
+            log!("{why}; starting without the loopback, so the echo canceller has no far end");
+        }
         let mut engine = Engine {
             aggregate: kAudioObjectUnknown,
             path,
-            far_end: Err(NOT_INSTALLED),
+            far_end: Err(NOT_INSTALLED.to_owned()),
             io_proc: None,
             running: false,
             listening: false,
@@ -172,33 +182,30 @@ impl Engine {
         self.context.as_deref().expect(RELEASED)
     }
 
-    /// Creates the aggregate and starts IO on it. An aggregate with the loopback has to
-    /// confirm the order of its streams, or one without the loopback replaces it.
-    fn build(&mut self, mut plan: Plan) -> Result<(), Error> {
-        let parts = loop {
-            let parts = self.create(&plan)?;
-            let order = read_order(self.aggregate, &plan.members());
-            match order.verdict(plan.loopback_uid.is_some()) {
-                Verdict::Run => {
-                    if order != Order::Confirmed {
-                        log!("{order}; the stream counts match, so the engine runs");
-                    }
-                    break parts;
+    /// Creates the aggregate and starts IO on it, without the loopback if that fails with it.
+    fn build(&mut self, plan: Plan) -> Result<(), Error> {
+        build_with(self, plan, Engine::attempt, Engine::dismantle)
+    }
+
+    /// Creates the aggregate for `plan`, checks the order of its streams and starts IO on it.
+    /// After an error, `dismantle` undoes whatever was set up.
+    fn attempt(&mut self, plan: &Plan) -> Result<(), Error> {
+        let parts = self.create(plan)?;
+        let order = read_order(self.aggregate, &plan.members());
+        match order.verdict(plan.loopback.is_ok()) {
+            Verdict::Run => {
+                if order != Order::Confirmed {
+                    log!("{order}; the stream counts match, so the engine runs");
                 }
-                Verdict::RunWithoutLoopback => {
-                    log!(
-                        "{order}; starting without the loopback, so the echo canceller has no \
-                         far end"
-                    );
-                    // No IOProc exists yet, so this only destroys the aggregate.
-                    self.dismantle();
-                    plan = plan.without_loopback();
-                    self.far_end = Err(ORDER_UNCONFIRMED);
-                }
-                Verdict::Fail => return Err(Error(order.to_string())),
             }
-        };
-        self.configure(&plan, parts)
+            // `build_with` then starts over without the loopback.
+            Verdict::RunWithoutLoopback => {
+                log!("{order}");
+                return Err(Error(ORDER_UNCONFIRMED.into()));
+            }
+            Verdict::Fail => return Err(Error(order.to_string())),
+        }
+        self.configure(plan, parts)
     }
 
     /// Creates the aggregate for `plan` and waits until it has picked up its sub-devices and
@@ -226,6 +233,11 @@ impl Engine {
     fn configure(&mut self, plan: &Plan, parts: Parts) -> Result<(), Error> {
         let aggregate = self.aggregate;
         let layout = plan.layout;
+        let komplete = plan.path.komplete;
+        let first = |scope| hal::streams(komplete, scope).ok()?.first().copied();
+        let input = Leg::read(komplete, first(INPUT), INPUT);
+        let output = Leg::read(komplete, first(OUTPUT), OUTPUT);
+        self.far_end = far_end(plan, &output, &input);
         let Parts {
             inputs,
             outputs,
@@ -301,7 +313,7 @@ impl Engine {
             outputs.len(),
             drift.join(", "),
         );
-        self.report_latency(plan, cycle_usage);
+        self.report_latency(plan, cycle_usage, &input, &output);
         report_output();
         report_members(self.aggregate);
 
@@ -313,12 +325,11 @@ impl Engine {
     }
 
     /// Logs the latency from the Komplete's input to the visible mic's input, in frames at
-    /// 48 kHz, from what the devices report. With the loopback it also works out the echo
-    /// delay.
-    fn report_latency(&mut self, plan: &Plan, cycle_usage: f32) {
+    /// 48 kHz, from what the devices report, and the echo delay when the chain gets one.
+    /// `komplete` and `output` are the Komplete's input and output.
+    fn report_latency(&self, plan: &Plan, cycle_usage: f32, komplete: &Leg, output: &Leg) {
         let path = plan.path;
         let first = |device, scope| hal::streams(device, scope).ok()?.first().copied();
-        let komplete = Leg::read(path.komplete, first(path.komplete, INPUT), INPUT);
         let feed = Leg::read(path.feed, first(path.feed, OUTPUT), OUTPUT);
         let mic = Leg::read(path.mic, first(path.mic, INPUT), INPUT);
         let safety = |scope| -> u32 {
@@ -347,10 +358,7 @@ impl Engine {
             + mic.total();
         let ms = |frames: u32| f64::from(frames) / SAMPLE_RATE * 1e3;
         let mut echo = String::new();
-        if plan.loopback_uid.is_some() {
-            let output = Leg::read(path.komplete, first(path.komplete, OUTPUT), OUTPUT);
-            let delay = echo_delay(&output, &komplete);
-            self.far_end = Ok(delay);
+        if let Ok(&delay) = self.far_end.as_ref() {
             echo = format!(
                 "; the echo follows the loopback's copy of what plays by at least Komplete \
                  output {}+{} + input {}+{} (device+stream): echo delay {delay} = {:.1} ms",
@@ -383,8 +391,11 @@ impl Engine {
     }
 
     /// The echo delay to give the chain, in samples, or why the chain gets no far end.
-    pub fn far_end(&self) -> Result<usize, &'static str> {
-        self.far_end.map(|delay| delay as usize)
+    pub fn far_end(&self) -> Result<usize, &str> {
+        match &self.far_end {
+            Ok(delay) => Ok(*delay as usize),
+            Err(why) => Err(why),
+        }
     }
 
     /// False once the aggregate or the Komplete is gone.
@@ -501,27 +512,78 @@ struct Parts {
     resampled: Vec<ObjectId>,
 }
 
+/// Runs `attempt` on `plan`. When that fails on a plan with the loopback, it runs once more on
+/// the plan without it, as long as `dismantle` shows that nothing of the first attempt can
+/// still run: the chain lives in the context, which a second IOProc can only have once the
+/// first is provably gone.
+fn build_with<E>(
+    engine: &mut E,
+    mut plan: Plan,
+    attempt: impl Fn(&mut E, &Plan) -> Result<(), Error>,
+    dismantle: impl Fn(&mut E) -> bool,
+) -> Result<(), Error> {
+    loop {
+        let error = match attempt(engine, &plan) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        if plan.loopback.is_err() || !dismantle(engine) {
+            return Err(error);
+        }
+        let why = format!("with the loopback, {error}");
+        log!("{why}; starting without it, so the echo canceller has no far end");
+        plan = plan.without_loopback(why);
+    }
+}
+
 /// What an engine is built from, read before anything is created.
 struct Plan {
     path: Path,
     komplete_uid: String,
     feed_uid: String,
-    loopback_uid: Option<String>,
+    /// The loopback's UID, or why the aggregate goes without the loopback.
+    loopback: Result<String, String>,
     layout: Layout,
 }
 
+/// What the loopback's device says about itself.
+struct Loopback {
+    uid: String,
+    rate: f64,
+    inputs: usize,
+    outputs: usize,
+}
+
+impl Loopback {
+    fn read(device: ObjectId) -> hal::Result<Loopback> {
+        Ok(Loopback {
+            uid: hal::uid(device)?,
+            rate: hal::sample_rate(device)?,
+            inputs: hal::streams(device, INPUT)?.len(),
+            outputs: hal::streams(device, OUTPUT)?.len(),
+        })
+    }
+
+    /// Itself, or why the engine can't read what plays from it.
+    fn usable(self) -> Result<Loopback, String> {
+        if self.rate != SAMPLE_RATE {
+            Err(format!("the loopback runs at {} Hz, not 48000", self.rate))
+        } else if self.inputs == 0 {
+            Err("the loopback has no input stream".to_owned())
+        } else {
+            Ok(self)
+        }
+    }
+}
+
 impl Plan {
-    fn read(path: Path) -> Result<Plan, Error> {
+    /// The Komplete and the feed have to be there and right, or there is no engine. The
+    /// loopback is left out when `skip_loopback` gives a reason not to look at it, and when it
+    /// can't be read or used.
+    fn read(path: Path, skip_loopback: Option<&str>) -> Result<Plan, Error> {
         let komplete_uid = hal::uid(path.komplete)?;
         let feed_uid = hal::uid(path.feed)?;
-        let loopback_uid = path.loopback.map(hal::uid).transpose()?;
-        let devices = [
-            ("the Komplete", Some(path.komplete)),
-            ("the feed", Some(path.feed)),
-            ("the loopback", path.loopback),
-        ];
-        for (name, device) in devices {
-            let Some(device) = device else { continue };
+        for (name, device) in [("the Komplete", path.komplete), ("the feed", path.feed)] {
             let rate = hal::sample_rate(device)?;
             if rate != SAMPLE_RATE {
                 return Err(Error(format!("{name} runs at {rate} Hz, not 48000")));
@@ -533,28 +595,49 @@ impl Plan {
             komplete_outputs: count(path.komplete, OUTPUT)?,
             feed_inputs: count(path.feed, INPUT)?,
             feed_outputs: count(path.feed, OUTPUT)?,
-            loopback: match path.loopback {
-                Some(loopback) => Some((count(loopback, INPUT)?, count(loopback, OUTPUT)?)),
-                None => None,
-            },
+            loopback: None,
         };
         if let Some(missing) = layout.missing() {
             return Err(Error(missing.into()));
         }
-        Ok(Plan {
+        let loopback = match (path.loopback, skip_loopback) {
+            (None, _) => Err(NOT_INSTALLED.to_owned()),
+            (Some(_), Some(why)) => Err(why.to_owned()),
+            (Some(device), None) => Loopback::read(device)
+                .map_err(|error| format!("the loopback can't be read: {error}")),
+        };
+        Ok(Plan::new(path, komplete_uid, feed_uid, layout, loopback))
+    }
+
+    /// The plan for the Komplete and the feed, whose streams `layout` counts, with the
+    /// loopback if the engine can use it. `loopback` is what its device says, or why it is
+    /// left out.
+    fn new(
+        path: Path,
+        komplete_uid: String,
+        feed_uid: String,
+        layout: Layout,
+        loopback: Result<Loopback, String>,
+    ) -> Plan {
+        let loopback = loopback.and_then(Loopback::usable);
+        let streams = |loopback: &Loopback| (loopback.inputs, loopback.outputs);
+        Plan {
             path,
             komplete_uid,
             feed_uid,
-            loopback_uid,
-            layout,
-        })
+            layout: Layout {
+                loopback: loopback.as_ref().ok().map(streams),
+                ..layout
+            },
+            loopback: loopback.map(|loopback| loopback.uid),
+        }
     }
 
     /// The members after the Komplete, in the order the aggregate gets them: the feed, then the
     /// loopback. The Komplete is the clock and these are resampled to it.
     fn resampled(&self) -> Vec<&str> {
         let mut uids = vec![self.feed_uid.as_str()];
-        uids.extend(self.loopback_uid.as_deref());
+        uids.extend(self.loopback.as_deref().ok());
         uids
     }
 
@@ -565,9 +648,9 @@ impl Plan {
         uids
     }
 
-    /// The same plan for an aggregate of the Komplete and the feed alone.
-    fn without_loopback(mut self) -> Plan {
-        self.loopback_uid = None;
+    /// The same plan for an aggregate of the Komplete and the feed alone, and why.
+    fn without_loopback(mut self, why: String) -> Plan {
+        self.loopback = Err(why);
         self.layout.loopback = None;
         self
     }
@@ -588,14 +671,13 @@ struct Layout {
 }
 
 impl Layout {
-    /// The stream the engine can't run without, if one is not there.
+    /// The stream the engine can't run without, if one is not there. The loopback's is not
+    /// one of them: `Loopback::usable` leaves a loopback without it out of the plan.
     fn missing(&self) -> Option<&'static str> {
         if self.komplete_inputs == 0 {
             Some("the Komplete has no input stream")
         } else if self.feed_outputs == 0 {
             Some("the feed has no output stream")
-        } else if self.loopback.is_some_and(|(inputs, _)| inputs == 0) {
-            Some("the loopback has no input stream")
         } else {
             None
         }
@@ -704,6 +786,15 @@ impl Cycle {
 /// certain.
 fn echo_delay(output: &Leg, input: &Leg) -> u32 {
     output.device + output.stream + input.device + input.stream
+}
+
+/// What the chain gets as its far end under `plan`: the echo delay in frames, from the
+/// Komplete's `output` and `input`, or why the aggregate has no loopback to read.
+fn far_end(plan: &Plan, output: &Leg, input: &Leg) -> Result<u32, String> {
+    match &plan.loopback {
+        Ok(_) => Ok(echo_delay(output, input)),
+        Err(why) => Err(why.clone()),
+    }
 }
 
 /// The process ID keeps a second instance, or a stale one, from colliding on the UID.
@@ -1030,10 +1121,6 @@ mod tests {
             no(|layout| layout.feed_outputs = 0),
             Some("the feed has no output stream")
         );
-        assert_eq!(
-            no(|layout| layout.loopback = Some((0, 1))),
-            Some("the loopback has no input stream")
-        );
         // Nothing is written to the Komplete, so it needs no output stream.
         let mut input_only = layout(true);
         input_only.komplete_outputs = 0;
@@ -1124,32 +1211,228 @@ mod tests {
         assert_eq!(unknown.verdict(false), Verdict::Run);
     }
 
+    const PATH: Path = Path {
+        komplete: 3,
+        feed: 2,
+        mic: 1,
+        loopback: Some(5),
+    };
+
+    /// A plan from what the loopback's device says, or why it is not looked at.
+    fn plan(loopback: Result<Loopback, String>) -> Plan {
+        Plan::new(
+            PATH,
+            "komplete".into(),
+            "feed".into(),
+            layout(false),
+            loopback,
+        )
+    }
+
+    /// The loopback of Francisco's Speakers as BlackHole builds it.
+    fn loopback() -> Loopback {
+        Loopback {
+            uid: "loopback".into(),
+            rate: 48_000.0,
+            inputs: 1,
+            outputs: 0,
+        }
+    }
+
     #[test]
     fn a_plan_without_its_loopback_is_the_aggregate_of_the_komplete_and_the_feed() {
-        let path = Path {
-            komplete: 3,
-            feed: 2,
-            mic: 1,
-            loopback: Some(5),
-        };
-        let plan = Plan {
-            path,
-            komplete_uid: "komplete".into(),
-            feed_uid: "feed".into(),
-            loopback_uid: Some("loopback".into()),
-            layout: layout(true),
-        };
+        let plan = plan(Ok(loopback()));
         assert_eq!(plan.members(), ["komplete", "feed", "loopback"]);
         assert_eq!(plan.resampled(), ["feed", "loopback"]);
+        assert_eq!(plan.layout.loopback_input(), Some(1));
 
-        let plan = plan.without_loopback();
+        let plan = plan.without_loopback("why".into());
+        assert_eq!(plan.loopback, Err("why".to_owned()));
         assert_eq!(plan.members(), ["komplete", "feed"]);
         assert_eq!(plan.resampled(), ["feed"]);
         assert_eq!(plan.layout.loopback_input(), None);
         assert_eq!(plan.layout.input_usage(), [true]);
         assert_eq!(plan.layout.output_usage(), [false, true]);
         // The devices the daemon asked for stay, so it does not take the engine for stale.
-        assert!(plan.path == path);
+        assert!(plan.path == PATH);
+    }
+
+    /// The engine starts whatever is wrong with the loopback: the plan is then the one for the
+    /// Komplete and the feed alone, and carries the reason for the log and the status line.
+    #[test]
+    fn a_loopback_the_engine_cannot_use_is_left_out_of_the_plan() {
+        let unusable = [
+            (
+                Err("Francisco's Speakers is not installed".to_owned()),
+                "Francisco's Speakers is not installed",
+            ),
+            (
+                Err("the loopback can't be read: get 'uid ' failed: 'who?'".to_owned()),
+                "the loopback can't be read: get 'uid ' failed: 'who?'",
+            ),
+            (
+                Ok(Loopback {
+                    rate: 44_100.0,
+                    ..loopback()
+                }),
+                "the loopback runs at 44100 Hz, not 48000",
+            ),
+            (
+                Ok(Loopback {
+                    inputs: 0,
+                    outputs: 1,
+                    ..loopback()
+                }),
+                "the loopback has no input stream",
+            ),
+        ];
+        for (loopback, why) in unusable {
+            let plan = plan(loopback);
+            assert_eq!(plan.loopback, Err(why.to_owned()));
+            assert_eq!(plan.members(), ["komplete", "feed"]);
+            assert_eq!(plan.layout.missing(), None);
+            assert_eq!((plan.layout.inputs(), plan.layout.outputs()), (1, 2));
+            assert_eq!(plan.layout.input_usage(), [true]);
+            assert_eq!(plan.layout.output_usage(), [false, true]);
+        }
+
+        // A loopback with more streams than BlackHole gives it is used, and counted.
+        let wide = plan(Ok(Loopback {
+            inputs: 2,
+            outputs: 1,
+            ..loopback()
+        }));
+        assert_eq!(wide.loopback, Ok("loopback".to_owned()));
+        assert_eq!((wide.layout.inputs(), wide.layout.outputs()), (3, 3));
+    }
+
+    /// The echo delay comes with the plan, not with the latency report: with the loopback the
+    /// chain gets the Komplete's latency out and in, and without it the plan's reason.
+    #[test]
+    fn the_far_end_is_the_echo_delay_with_the_loopback_and_the_reason_without() {
+        let leg = |device, stream| Leg {
+            device,
+            stream,
+            safety: 999,
+        };
+        let (output, input) = (leg(14, 0), leg(70, 4));
+        let with_loopback = plan(Ok(loopback()));
+        assert_eq!(far_end(&with_loopback, &output, &input), Ok(88));
+        let without = with_loopback.without_loopback("with the loopback, it failed".into());
+        assert_eq!(
+            far_end(&without, &output, &input),
+            Err("with the loopback, it failed".to_owned())
+        );
+    }
+
+    /// What `build_with` did to a stand-in for the engine: the members of each attempt's plan,
+    /// and whether it dismantled what the attempt before left.
+    #[derive(Default)]
+    struct Tries {
+        members: Vec<Vec<String>>,
+        dismantled: usize,
+    }
+
+    /// Runs `build_with` with attempts that fail the way `fails` says for each plan.
+    /// `free` is what dismantling a failed attempt reports.
+    fn build(plan: Plan, free: bool, fails: fn(&Plan) -> Option<&'static str>) -> (Tries, String) {
+        let mut tries = Tries::default();
+        let result = build_with(
+            &mut tries,
+            plan,
+            |tries, plan| {
+                let members = plan.members().into_iter().map(str::to_owned);
+                tries.members.push(members.collect());
+                fails(plan).map_or(Ok(()), |error| Err(Error(error.into())))
+            },
+            |tries| {
+                tries.dismantled += 1;
+                free
+            },
+        );
+        let outcome = result.map_or_else(|error| error.to_string(), |()| "runs".to_owned());
+        (tries, outcome)
+    }
+
+    /// An aggregate with the loopback that fails anywhere, such as a loopback stream in a
+    /// format the IOProc can't read, is dismantled and replaced by one without the loopback.
+    #[test]
+    fn an_engine_that_fails_with_the_loopback_is_built_once_more_without_it() {
+        let with_loopback = |plan: &Plan| {
+            plan.loopback
+                .is_ok()
+                .then_some("the loopback stream is not Float32 at 48 kHz")
+        };
+        let (tries, outcome) = build(plan(Ok(loopback())), true, with_loopback);
+        assert_eq!(outcome, "runs");
+        assert_eq!(
+            tries.members,
+            [
+                vec!["komplete", "feed", "loopback"],
+                vec!["komplete", "feed"]
+            ]
+        );
+        assert_eq!(tries.dismantled, 1);
+
+        // An engine that works with the loopback keeps it.
+        let (tries, outcome) = build(plan(Ok(loopback())), true, |_| None);
+        assert_eq!(outcome, "runs");
+        assert_eq!(tries.members, [["komplete", "feed", "loopback"]]);
+        assert_eq!(tries.dismantled, 0);
+    }
+
+    #[test]
+    fn the_second_build_gets_the_reason_and_is_the_last() {
+        // The plan without the loopback says why, for the status line.
+        let mut tries = Vec::new();
+        let result = build_with(
+            &mut tries,
+            plan(Ok(loopback())),
+            |tries: &mut Vec<Result<String, String>>, plan| {
+                tries.push(plan.loopback.clone());
+                plan.loopback.as_ref().map_or(Ok(()), |_| {
+                    Err(Error("create IOProc failed: 'nope'".into()))
+                })
+            },
+            |_| true,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            tries,
+            [
+                Ok("loopback".to_owned()),
+                Err("with the loopback, create IOProc failed: 'nope'".to_owned())
+            ]
+        );
+
+        // An aggregate that fails without the loopback too is the start's failure.
+        let (tries, outcome) = build(plan(Ok(loopback())), true, |plan| {
+            Some(if plan.loopback.is_ok() {
+                "first"
+            } else {
+                "second"
+            })
+        });
+        assert_eq!(outcome, "second");
+        assert_eq!(tries.members.len(), 2);
+        assert_eq!(tries.dismantled, 1);
+
+        // A plan that never had the loopback is tried once.
+        let plain = plan(Err("Francisco's Speakers is not installed".to_owned()));
+        let (tries, outcome) = build(plain, true, |_| Some("create aggregate failed"));
+        assert_eq!(outcome, "create aggregate failed");
+        assert_eq!(tries.members, [["komplete", "feed"]]);
+        assert_eq!(tries.dismantled, 0);
+    }
+
+    /// The chain is in the context of the first attempt's IOProc. When that IOProc can't be
+    /// shown to be gone, no second IOProc may get the chain, so the start fails.
+    #[test]
+    fn no_second_build_while_the_first_io_proc_may_still_run() {
+        let (tries, outcome) = build(plan(Ok(loopback())), false, |_| Some("start IO failed"));
+        assert_eq!(outcome, "start IO failed");
+        assert_eq!(tries.members, [["komplete", "feed", "loopback"]]);
+        assert_eq!(tries.dismantled, 1);
     }
 
     fn string(value: &CFType) -> String {

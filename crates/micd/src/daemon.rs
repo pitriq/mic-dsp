@@ -333,7 +333,8 @@ impl Daemon {
         };
         // What a kept chain counted on the engines before this one.
         let before = control.status();
-        match Engine::start(path, chain, Capture::requested(&self.config_dir)) {
+        let capture = Capture::requested(&self.config_dir);
+        match Engine::start(path, chain, capture, None) {
             Ok(engine) => {
                 let now = Instant::now();
                 if let Ok(delay) = engine.far_end() {
