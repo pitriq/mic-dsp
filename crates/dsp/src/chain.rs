@@ -130,6 +130,45 @@ impl Chain {
         self.run(input, reference, output, channels);
     }
 
+    /// Real-time safe. Runs only the high-pass and the echo canceller on `input` against
+    /// `reference`, and puts out nothing, so the canceller keeps learning the echo path while
+    /// no app reads the mic. The other stages rest; the first frame after `process` resumes
+    /// still holds what they had.
+    pub fn listen(
+        &mut self,
+        input: &[f32],
+        in_channels: usize,
+        reference: &[f32],
+        reference_channels: usize,
+    ) {
+        #[cfg(debug_assertions)]
+        assert_no_alloc::assert_no_alloc(|| {
+            self.run_listening(input, in_channels, reference, reference_channels)
+        });
+        #[cfg(not(debug_assertions))]
+        self.run_listening(input, in_channels, reference, reference_channels);
+    }
+
+    fn run_listening(
+        &mut self,
+        input: &[f32],
+        in_channels: usize,
+        reference: &[f32],
+        reference_channels: usize,
+    ) {
+        if let Some(params) = self.echo.fresh() {
+            self.core.echo.set_params(params);
+        }
+        self.core.listening = true;
+        self.core.reblock(
+            input.chunks_exact(in_channels.max(1)).map(|frame| frame[0]),
+            mean_of(reference, reference_channels),
+            |_| {},
+        );
+        self.core.listening = false;
+        self.status.publish(self.core.status());
+    }
+
     /// `channels`: input, reference, output.
     fn run(&mut self, input: &[f32], reference: &[f32], output: &mut [f32], channels: [usize; 3]) {
         let [in_channels, reference_channels, out_channels] = channels;
@@ -145,21 +184,33 @@ impl Chain {
         };
         debug_assert!(input.len() == frames * in_channels && output.len() == frames * out_channels);
         let (heard, silent) = output.split_at_mut(frames * out_channels);
-        // With one channel the mean is the channel itself, bit for bit.
-        let reference_channels = reference_channels.max(1);
-        let scale = 1.0 / reference_channels as f32;
-        let far = reference
-            .chunks_exact(reference_channels)
-            .map(|frame| frame.iter().sum::<f32>() * scale)
-            .chain(std::iter::repeat(0.0));
+        let mut heard = heard.chunks_exact_mut(out_channels.max(1));
         self.core.reblock(
-            input.chunks_exact(in_channels.max(1)).map(|frame| frame[0]),
-            far,
-            heard.chunks_exact_mut(out_channels.max(1)),
+            input
+                .chunks_exact(in_channels.max(1))
+                .map(|frame| frame[0])
+                .take(frames),
+            mean_of(reference, reference_channels),
+            |sample| {
+                if let Some(out) = heard.next() {
+                    out.fill(sample);
+                }
+            },
         );
         silent.fill(0.0);
         self.status.publish(self.core.status());
     }
+}
+
+/// The mean of each interleaved frame's channels, then silence. With one channel the mean is
+/// the channel itself, bit for bit.
+fn mean_of(reference: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
+    let channels = channels.max(1);
+    let scale = 1.0 / channels as f32;
+    reference
+        .chunks_exact(channels)
+        .map(move |frame| frame.iter().sum::<f32>() * scale)
+        .chain(std::iter::repeat(0.0))
 }
 
 #[cfg(feature = "offline")]
@@ -210,6 +261,8 @@ struct Core {
     block: [f32; FRAME],
     /// The reference, re-blocked in step with `block`.
     reference: [f32; FRAME],
+    /// Set while `Chain::listen` runs: frames stop after the echo canceller.
+    listening: bool,
     #[cfg(feature = "offline")]
     echo_output: [f32; FRAME],
     filled: usize,
@@ -242,6 +295,7 @@ impl Core {
             limiter: Limiter::new(rate, params.limiter),
             block: [0.0; FRAME],
             reference: [0.0; FRAME],
+            listening: false,
             #[cfg(feature = "offline")]
             echo_output: [0.0; FRAME],
             filled: 0,
@@ -282,14 +336,14 @@ impl Core {
     /// Every stage sees whole frames whatever the callback size. Each output sample is
     /// taken before the input sample that replaces it, so the delay is one frame for every
     /// way of cutting the stream into callbacks.
-    fn reblock<'a>(
+    fn reblock(
         &mut self,
         input: impl Iterator<Item = f32>,
         reference: impl Iterator<Item = f32>,
-        output: impl Iterator<Item = &'a mut [f32]>,
+        mut emit: impl FnMut(f32),
     ) {
-        for ((x, far), out) in input.zip(reference).zip(output) {
-            out.fill(self.block[self.filled]);
+        for (x, far) in input.zip(reference) {
+            emit(self.block[self.filled]);
             self.block[self.filled] = if x.is_finite() {
                 x
             } else {
@@ -316,6 +370,11 @@ impl Core {
         #[cfg(feature = "offline")]
         {
             self.echo_output = *x;
+        }
+        if self.listening {
+            // Nobody hears this frame, so the voice detection has nothing to say.
+            self.echo.voice(false);
+            return;
         }
         self.meter.measure(x);
         self.gain.process(x);

@@ -176,8 +176,18 @@ impl Context {
         }
 
         if !self.mic_in_use.load(Ordering::Relaxed) {
-            // The chain rests, and the mic reads silence.
+            // The chain rests and the mic reads silence, but while something plays the echo
+            // canceller keeps learning the room, so it is ready when an app opens the mic.
             realtime.stale = Chain::LATENCY;
+            if let (Some((source, source_channels)), false) = (source, played.is_empty()) {
+                let frames = (source.len() / source_channels).min(played.len() / played_channels);
+                realtime.chain.listen(
+                    &source[..frames * source_channels],
+                    source_channels,
+                    &played[..frames * played_channels],
+                    played_channels,
+                );
+            }
             if let Some((feed, _)) = feed {
                 feed.fill(0.0);
             }
@@ -563,9 +573,9 @@ mod tests {
         assert!(feed.chunks(2).all(|frame| frame[0] == frame[1]));
     }
 
-    /// While no app reads the mic the IOProc still forwards what plays, the chain does not run
-    /// and the feed is silent. When an app comes back, the audio the chain held from before
-    /// stays in: the feed is silent for the chain's latency and then carries the mic again.
+    /// While no app reads the mic the IOProc still forwards what plays, only the echo canceller
+    /// runs and the feed is silent. When an app comes back, the audio the chain held from
+    /// before stays in: the feed is silent for the chain's latency and then carries the mic.
     #[test]
     fn with_no_app_on_the_mic_the_io_proc_only_forwards_playback() {
         let (chain, mut control) = dsp::chain(&dsp::Config::default());
@@ -597,9 +607,10 @@ mod tests {
             run(&mut komplete, &mut feed);
             assert!(feed.iter().all(|&sample| sample == 0.0));
         }
+        // The echo canceller keeps learning while the far end plays; nothing reaches the feed.
         let resting = control.status();
-        assert_eq!(resting.frames, before.frames);
-        assert_eq!(resting.echo, before.echo);
+        assert_eq!(resting.frames, before.frames + 50 * 512);
+        assert!(resting.echo.active_frames > before.echo.active_frames);
         let stats = &context.stats;
         assert_eq!(stats.frames.load(Ordering::Relaxed), 512);
 
@@ -615,7 +626,7 @@ mod tests {
         assert!(resumed[Chain::LATENCY..]
             .iter()
             .any(|&sample| sample != 0.0));
-        assert_eq!(control.status().frames, before.frames + 6 * 512);
+        assert_eq!(control.status().frames, before.frames + 56 * 512);
 
         assert_eq!(stats.callbacks.load(Ordering::Relaxed), 156);
         assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
