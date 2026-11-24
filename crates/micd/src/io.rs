@@ -192,7 +192,6 @@ impl Context {
                             input_time.mSampleTime,
                             output_time.mSampleTime,
                             input_time.mHostTime as f64,
-                            frames as f64,
                         ],
                     );
                 }
