@@ -39,6 +39,8 @@ To undo it, pick the Komplete as the output again and delete the Multi-Output De
 
 The daemon logs to `~/Library/Logs/mic-dsp/micd.log` and reads an optional `~/.config/mic-dsp/config.toml`, where `[gain] db` sets the input gain (+4.5 dB by default). The log's status line says what gain the measured speech needs and what the echo canceller removed.
 
+The daemon keeps what the echo canceller has learned in `~/Library/Caches/mic-dsp`, so that the first call after it starts does not let echo through while the canceller learns the room again. There is one state for open headphones and one for speakers (`echo-headphones.bin`, `echo-speakers.bin`), and `echo-last` names the one used last. The daemon tells the two setups apart by how loud the echo is, saves after every call with 5 s of sound from the other side, and starts each call by trying both. To clear the cache, move the folder to the Trash and restart the daemon, which otherwise still holds the last state in memory. It writes new files after the next such call.
+
 ## Offline mode
 
 ```sh

@@ -18,6 +18,7 @@ use crate::capture::Capture;
 use crate::engine::{self, Engine, Failed};
 use crate::hal::{self, ObjectId};
 use crate::permission::{self, Permission};
+use crate::presets::{self, Presets, Session, Slot};
 use crate::settings::{self, Settings};
 use crate::{io, wake};
 
@@ -121,6 +122,14 @@ struct Daemon {
     chain: Option<Box<Chain>>,
     /// The handle to that chain, wherever the chain is. `None` while there is no chain.
     control: Option<Control>,
+    /// The echo canceller's saved states: what a new chain starts from, and what each session
+    /// tries against the canceller in use.
+    presets: Presets,
+    /// The setup whose state the chain's canceller has: the one it was loaded with, switched
+    /// to or last saved under. `None` until one of those happened.
+    slot: Option<Slot>,
+    /// What the running engine's session started with.
+    session: Session,
     settings: Settings,
     /// Whether the chain last reported exact-zero input.
     input_dead: bool,
@@ -167,7 +176,7 @@ const SYSTEM_LISTENERS: [(u32, u32); 2] = [
 ];
 
 impl Daemon {
-    fn new(settings: Settings, config_dir: PathBuf) -> Daemon {
+    fn new(settings: Settings, config_dir: PathBuf, presets: Presets) -> Daemon {
         let now = Instant::now();
         Daemon {
             config_dir,
@@ -176,6 +185,9 @@ impl Daemon {
             engine: None,
             chain: None,
             control: None,
+            presets,
+            slot: None,
+            session: Session::default(),
             settings,
             input_dead: false,
             hold_until: None,
@@ -335,19 +347,34 @@ impl Daemon {
             return;
         };
         log!("the mic is in use; starting");
-        let (chain, mut control) = match (self.chain.take(), self.control.take()) {
+        let mut new_chain = false;
+        let (mut chain, mut control) = match (self.chain.take(), self.control.take()) {
             (Some(chain), Some(mut control)) => {
                 // A config that changed while no engine ran applies now.
                 self.settings.tick(&mut control);
                 (chain, control)
             }
             _ => {
-                log!("building a new chain; its echo canceller has yet to learn the room");
-                self.settings.chain()
+                log!("building a new chain");
+                let (mut chain, control) = self.settings.chain();
+                // Its canceller starts from what the last one learned, when that was saved.
+                self.slot = self.presets.load(&mut chain);
+                new_chain = true;
+                (chain, control)
             }
         };
+        // The session starts with the other setup's state as a second canceller, in case the
+        // owner changed between headphones and speakers.
+        let candidate = self.presets.start(&mut chain, self.slot);
         // What a kept chain counted on the engines before this one.
         let before = control.status();
+        let session = Session {
+            current: self.slot,
+            candidate,
+            echo: before.echo,
+            new_chain,
+        };
+        log!("{}", session.describe());
         let capture = Capture::requested(&self.config_dir);
         let skip_loopback = self.skip_loopback(Instant::now());
         match Engine::start(path, chain, capture, skip_loopback) {
@@ -361,6 +388,7 @@ impl Daemon {
                 }
                 self.engine = Some(engine);
                 self.control = Some(control);
+                self.session = session;
                 self.input_dead = before.input_dead;
                 self.progress = (0, now);
                 self.status = (0, now + STATUS_INTERVAL);
@@ -436,8 +464,17 @@ impl Daemon {
         // This stops IO and destroys the IOProc and the aggregate. The chain comes back for
         // the next engine, unless its IOProc may still run on it.
         self.chain = engine.stop();
-        if self.chain.is_none() {
-            self.control = None;
+        match (&self.chain, &mut self.control) {
+            (Some(chain), Some(control)) => {
+                // The IOProc is gone, so this is all the session counted.
+                let echo = control.status().echo;
+                let (slot, message) = self.presets.finish(chain, &self.session, &echo);
+                self.slot = slot;
+                if let Some(message) = message {
+                    log!("{message}");
+                }
+            }
+            _ => self.control = None,
         }
         self.hold_until = None;
         log!("stopped");
@@ -510,7 +547,10 @@ impl Daemon {
             echo: status.echo,
             missing: stats.reference_missing.load(Ordering::Relaxed),
         };
-        let echo = describe_echo(engine.far_end().err(), &seen, &self.seen);
+        let mut echo = describe_echo(engine.far_end().err(), &seen, &self.seen);
+        if engine.far_end().is_ok() {
+            echo += &describe_presets(&self.session, &status.echo);
+        }
         self.seen = seen;
         let micros = |ticks: u64| ticks as f64 * self.nanos_per_tick / 1e3;
         let flags: String = [
@@ -612,6 +652,19 @@ fn describe_echo(off: Option<&str>, now: &Seen, earlier: &Seen) -> String {
     line
 }
 
+/// What the status line adds about the session's echo level, which is what its state will be
+/// filed under, and about its trial of two presets.
+fn describe_presets(session: &Session, echo: &EchoStatus) -> String {
+    let mut line = String::new();
+    if let Some(level) = echo.echo_level_db {
+        line += &format!(", echo {level:.1} dB under what plays");
+    }
+    if let Some(trial) = session.describe_trial(echo) {
+        line += &format!(", {trial}");
+    }
+    line
+}
+
 pub fn run() -> ExitCode {
     let dir = match settings::dir() {
         Ok(dir) => dir,
@@ -642,7 +695,14 @@ pub fn run() -> ExitCode {
     if let Err(error) = hal::use_hal_notification_thread() {
         log!("{error}");
     }
-    let mut daemon = Daemon::new(Settings::new(&dir), dir.clone());
+    let cache = match presets::dir() {
+        Ok(cache) => cache,
+        Err(error) => {
+            log!("no cache directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut daemon = Daemon::new(Settings::new(&dir), dir.clone(), Presets::new(cache));
     daemon.listen_to_system();
     daemon.refresh_devices();
     daemon.reconcile();
@@ -776,10 +836,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_status_line_says_how_loud_the_echo_is_and_which_preset_won() {
+        use dsp::EchoTrial;
+
+        let mut echo = EchoStatus::default();
+        let alone = Session::default();
+        assert_eq!(describe_presets(&alone, &echo), "");
+        echo.echo_level_db = Some(17.84);
+        assert_eq!(
+            describe_presets(&alone, &echo),
+            ", echo 17.8 dB under what plays"
+        );
+
+        let tried = Session {
+            current: Some(Slot::Headphones),
+            candidate: Some(Slot::Speakers),
+            ..Session::default()
+        };
+        echo.trial = EchoTrial::Running;
+        assert_eq!(
+            describe_presets(&tried, &echo),
+            ", echo 17.8 dB under what plays, trying the speakers preset against headphones"
+        );
+        echo.echo_level_db = None;
+        echo.trial = EchoTrial::Switched;
+        assert_eq!(
+            describe_presets(&tried, &echo),
+            ", took the speakers preset over headphones"
+        );
+    }
+
     fn daemon() -> Daemon {
         // Nothing here reads the directory.
         let dir = PathBuf::from("/nonexistent/mic-dsp");
-        Daemon::new(Settings::new(&dir), dir)
+        Daemon::new(Settings::new(&dir), dir.clone(), Presets::new(dir))
     }
 
     /// After the IOProc of an engine with the loopback stalled, starts leave the loopback out

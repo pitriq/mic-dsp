@@ -20,6 +20,7 @@ mod hal;
 mod io;
 mod objc;
 mod permission;
+mod presets;
 mod settings;
 mod wake;
 
