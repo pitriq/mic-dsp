@@ -1,11 +1,12 @@
 //! A debug recording of what the IOProc sees, for checking the echo canceller's far end live.
 //!
-//! When `~/.config/mic-dsp/capture` exists as an engine starts, that engine records its first
-//! seconds (40, or the number the file holds) into buffers allocated beforehand: the Komplete's
-//! channel 1, the tap's channel 1 and the feed's channel 1, plus the timestamps of every
-//! callback. Once the IOProc is gone the control thread writes them to
-//! `~/Library/Logs/mic-dsp/capture-<time>.wav` (three channels, 32-bit float) and `.csv`, and
-//! removes the trigger file, so one request records one session.
+//! When `~/.config/mic-dsp/capture` exists as an engine starts, that engine records the first
+//! seconds (40, or the number the file holds) in which an app reads the mic, into buffers
+//! allocated beforehand: the Komplete's channel 1, channel 1 of what the Mac plays (the
+//! loopback) and the feed's channel 1, plus the timestamps of every callback. Once the IOProc
+//! is gone the control thread writes them to `~/Library/Logs/mic-dsp/capture-<time>.wav` (three
+//! channels, 32-bit float) and `.csv`, and removes the trigger file, so one request records one
+//! engine.
 
 use std::cell::UnsafeCell;
 use std::fs;
@@ -24,7 +25,7 @@ const CALLBACKS_PER_SECOND: usize = 400;
 type Times = [f64; 5];
 
 pub struct Capture {
-    /// Interleaved mic, tap, feed. Only the IO thread writes, up to `frames`.
+    /// Interleaved mic, playback, feed. Only the IO thread writes, up to `frames`.
     samples: UnsafeCell<Box<[f32]>>,
     times: UnsafeCell<Box<[Times]>>,
     /// Frames and callbacks written so far, published by the IO thread.

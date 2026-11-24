@@ -1,6 +1,5 @@
 //! The few pieces of the Objective-C runtime micd calls by hand, so it needs no Objective-C
-//! crate. Core Foundation strings, arrays and numbers are toll-free bridged, so they pass as
-//! `NSString`, `NSArray` and `NSNumber`. Control thread only.
+//! crate. Control thread only.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::mem;
@@ -16,7 +15,6 @@ extern "C" {
     fn sel_registerName(name: *const c_char) -> Sel;
     fn objc_autoreleasePoolPush() -> *mut c_void;
     fn objc_autoreleasePoolPop(pool: *mut c_void);
-    fn objc_release(object: Id);
     fn objc_msgSend();
 }
 
@@ -40,15 +38,6 @@ pub unsafe fn send<F: Copy>() -> F {
     const { assert!(size_of::<F>() == size_of::<unsafe extern "C" fn()>()) };
     let send: unsafe extern "C" fn() = objc_msgSend;
     unsafe { mem::transmute_copy(&send) }
-}
-
-/// Gives up one reference to `object`.
-///
-/// # Safety
-///
-/// `object` must be an object the caller owns a reference to.
-pub unsafe fn release(object: Id) {
-    unsafe { objc_release(object) }
 }
 
 /// An autorelease pool that drains when dropped. The control thread has none of its own, so

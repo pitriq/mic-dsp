@@ -10,19 +10,19 @@ use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyIOProcStreamUsage,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
     kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyDevices,
-    kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioHardwarePropertyTranslateUIDToDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioStreamPropertyVirtualFormat, AudioDeviceIOProcID,
-    AudioHardwareIOProcStreamUsage, AudioObjectAddPropertyListener, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectRemovePropertyListener, AudioObjectSetPropertyData,
+    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioStreamPropertyVirtualFormat, AudioDeviceIOProcID, AudioHardwareIOProcStreamUsage,
+    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
+    AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
     kAudioFormatLinearPCM, AudioStreamBasicDescription,
 };
-use objc2_core_foundation::{CFRetained, CFString};
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
 
 use crate::wake;
 
@@ -210,6 +210,38 @@ pub fn get_string(object: ObjectId, selector: u32, scope: u32) -> Result<String>
     Ok(string.to_string())
 }
 
+/// Reads a property that is an array of strings.
+pub fn get_strings(object: ObjectId, selector: u32, scope: u32) -> Result<Vec<String>> {
+    let address = address(selector, scope);
+    let mut value: *mut CFArray<CFType> = ptr::null_mut();
+    let mut size = size_of::<*mut CFArray<CFType>>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast(),
+        )
+    };
+    check_property(status, "get", selector)?;
+    let bad = Error {
+        what: "get",
+        selector,
+        status: kAudioHardwareBadPropertySizeError,
+    };
+    let array = NonNull::new(value).ok_or(bad)?;
+    // The HAL hands the caller a reference to release.
+    let array = unsafe { CFRetained::from_raw(array) };
+    array
+        .to_vec()
+        .iter()
+        .map(|item| Some(item.downcast_ref::<CFString>()?.to_string()))
+        .collect::<Option<Vec<String>>>()
+        .ok_or(bad)
+}
+
 pub fn set<T: Plain>(object: ObjectId, selector: u32, scope: u32, value: &T) -> Result<()> {
     let address = address(selector, scope);
     let status = unsafe {
@@ -282,29 +314,6 @@ pub fn device_for_uid(uid: &str) -> Result<Option<ObjectId>> {
     };
     check_property(status, "get", kAudioHardwarePropertyTranslateUIDToDevice)?;
     Ok((device != kAudioObjectUnknown).then_some(device))
-}
-
-/// The HAL's object for a process, if the process is one of its clients.
-pub fn process_object(pid: libc::pid_t) -> Result<Option<ObjectId>> {
-    let address = address(kAudioHardwarePropertyTranslatePIDToProcessObject, GLOBAL);
-    let mut object: ObjectId = kAudioObjectUnknown;
-    let mut size = size_of::<ObjectId>() as u32;
-    let status = unsafe {
-        AudioObjectGetPropertyData(
-            SYSTEM,
-            NonNull::from(&address),
-            size_of::<libc::pid_t>() as u32,
-            ptr::from_ref(&pid).cast(),
-            NonNull::from(&mut size),
-            NonNull::from(&mut object).cast(),
-        )
-    };
-    check_property(
-        status,
-        "get",
-        kAudioHardwarePropertyTranslatePIDToProcessObject,
-    )?;
-    Ok((object != kAudioObjectUnknown).then_some(object))
 }
 
 pub fn name(object: ObjectId) -> Result<String> {
@@ -473,7 +482,7 @@ mod tests {
 
     #[test]
     fn only_interleaved_native_float32_at_48_khz_is_usable() {
-        // Packed float, which is what the Komplete, the feed and a tap report.
+        // Packed float, which is what the Komplete, the feed and the loopback report.
         let float = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
         assert_eq!(float_channels(&format(48_000.0, 2, 32, float)), Some(2));
         assert_eq!(float_channels(&format(48_000.0, 1, 32, float)), Some(1));

@@ -22,7 +22,5 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>mic-dsp reads the Komplete Audio 1 and sends the processed voice to Francisco's Mic.</string>
-	<key>NSAudioCaptureUsageDescription</key>
-	<string>mic-dsp hears what the computer plays so it can remove its echo from Francisco's Mic.</string>
 </dict>
 </plist>
