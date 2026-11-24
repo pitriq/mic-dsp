@@ -33,9 +33,11 @@ macOS then plays everything to both devices. The Komplete gets the sound from ma
 
 - The Mac's volume keys don't control a Multi-Output Device. Use the Komplete's knob, or the per-device sliders in Audio MIDI Setup. Leave the slider of Francisco's Speakers at full: it only sets the level of the copy the echo canceller gets.
 - macOS shows the orange mic indicator for any process that reads an input device, and the copy in Francisco's Speakers is read from one. The daemon reads it only while an app uses the mic, so the indicator stays off while the Mac just plays.
-- With the Komplete alone picked as the output, or without the speakers driver, the mic works the same and the echo canceller has nothing to cancel.
+- With the Komplete alone picked as the output, or without the speakers driver, the mic works the same but the echo canceller has no reference. On speakers the far end's voice then goes back into the call. Closed headphones are unaffected.
 
-To undo it, pick the Komplete as the output again and delete the Multi-Output Device. `driver/uninstall.sh` and `packaging/uninstall-agent.sh` undo the install. The daemon logs to `~/Library/Logs/mic-dsp/micd.log` and reads an optional `~/.config/mic-dsp/config.toml`, where `[gain] db` sets the input gain (+4.5 dB by default). The log's status line says what gain the measured speech needs and what the echo canceller removed.
+To undo it, pick the Komplete as the output again and delete the Multi-Output Device. `driver/uninstall.sh` and `packaging/uninstall-agent.sh` undo the install. The daemon does not use System Audio Recording. If mic-dsp is listed for it in System Settings > Privacy & Security, the grant is left from an earlier build that read the Mac's sound through a tap, and can be removed.
+
+The daemon logs to `~/Library/Logs/mic-dsp/micd.log` and reads an optional `~/.config/mic-dsp/config.toml`, where `[gain] db` sets the input gain (+4.5 dB by default). The log's status line says what gain the measured speech needs and what the echo canceller removed.
 
 ## Offline mode
 
