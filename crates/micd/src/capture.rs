@@ -6,7 +6,8 @@
 //! loopback) and the feed's channel 1, plus the timestamps of every callback. Once the IOProc
 //! is gone the control thread writes them to `~/Library/Logs/mic-dsp/capture-<time>.wav` (three
 //! channels, 32-bit float) and `.csv`, and removes the trigger file, so one request records one
-//! engine.
+//! engine. An engine that only forwarded playback records nothing and leaves the request for
+//! the next one.
 
 use std::cell::UnsafeCell;
 use std::fs;
@@ -82,8 +83,12 @@ impl Capture {
         self.frames.store(at + frames, Ordering::Release);
     }
 
-    /// Writes the recording and removes the trigger. Control thread, after the IOProc is gone.
-    pub fn write(&self) -> io::Result<PathBuf> {
+    /// Writes the recording and removes the trigger, unless nothing was recorded. Control
+    /// thread, after the IOProc is gone.
+    pub fn write(&self) -> io::Result<Option<PathBuf>> {
+        if self.frames.load(Ordering::Acquire) == 0 {
+            return Ok(None);
+        }
         let _ = fs::remove_file(self.config_dir.join("capture"));
         let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is not set"))?;
         let dir = Path::new(&home).join("Library/Logs/mic-dsp");
@@ -127,6 +132,6 @@ impl Capture {
             writeln!(csv, "{now},{input},{output},{host},{frames}")?;
         }
         csv.flush()?;
-        Ok(path)
+        Ok(Some(path))
     }
 }

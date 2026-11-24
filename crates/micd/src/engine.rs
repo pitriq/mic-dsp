@@ -421,7 +421,8 @@ impl Drop for Engine {
         if self.dismantle() {
             if let Some(capture) = &self.context.capture {
                 match capture.write() {
-                    Ok(path) => log!("capture written to {}", path.display()),
+                    Ok(Some(path)) => log!("capture written to {}", path.display()),
+                    Ok(None) => {}
                     Err(error) => log!("could not write the capture: {error}"),
                 }
             }

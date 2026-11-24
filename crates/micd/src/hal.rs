@@ -234,12 +234,16 @@ pub fn get_strings(object: ObjectId, selector: u32, scope: u32) -> Result<Vec<St
     let array = NonNull::new(value).ok_or(bad)?;
     // The HAL hands the caller a reference to release.
     let array = unsafe { CFRetained::from_raw(array) };
+    strings(&array).ok_or(bad)
+}
+
+/// The strings in `array`, or `None` if something in it is not a string.
+fn strings(array: &CFArray<CFType>) -> Option<Vec<String>> {
     array
         .to_vec()
         .iter()
         .map(|item| Some(item.downcast_ref::<CFString>()?.to_string()))
-        .collect::<Option<Vec<String>>>()
-        .ok_or(bad)
+        .collect()
 }
 
 pub fn set<T: Plain>(object: ObjectId, selector: u32, scope: u32, value: &T) -> Result<()> {
@@ -478,6 +482,19 @@ mod tests {
             mBitsPerChannel: bits,
             mReserved: 0,
         }
+    }
+
+    #[test]
+    fn an_array_property_is_read_as_strings_only_if_it_holds_nothing_else() {
+        let uids = [CFString::from_str("komplete"), CFString::from_str("feed")];
+        let items: Vec<&CFType> = uids.iter().map(|uid| uid.as_ref()).collect();
+        let array = CFArray::from_objects(&items);
+        assert_eq!(strings(&array).unwrap(), ["komplete", "feed"]);
+        assert_eq!(strings(&CFArray::empty()).unwrap(), [""; 0]);
+
+        let number = objc2_core_foundation::CFNumber::new_i32(7);
+        let mixed = CFArray::from_objects(&[items[0], number.as_ref()]);
+        assert_eq!(strings(&mixed), None);
     }
 
     #[test]
