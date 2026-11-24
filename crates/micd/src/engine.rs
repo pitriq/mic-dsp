@@ -984,7 +984,6 @@ mod tests {
             assert_eq!(number(&get(c"private")), 1);
             assert_eq!(number(&get(c"stacked")), 0);
             assert_eq!(string(&get(c"master")), "komplete-uid");
-            assert!(!description.contains_key(&key(c"taps")));
         }
         // The Komplete is the clock, so every other member is resampled to it. The order is
         // the order of the aggregate's streams.

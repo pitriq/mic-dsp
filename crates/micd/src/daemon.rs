@@ -370,7 +370,7 @@ impl Daemon {
 
     fn stop(&mut self) {
         if self.engine.is_some() {
-            self.print_status();
+            self.print_status(true);
             // Dropping the engine stops IO and destroys the IOProc and the aggregate, then frees
             // the chain.
             self.engine = None;
@@ -408,7 +408,7 @@ impl Daemon {
             self.watch_input(&status);
         }
         if now >= self.status.1 {
-            self.print_status();
+            self.print_status(false);
             self.status.1 = now + STATUS_INTERVAL;
         }
     }
@@ -431,12 +431,19 @@ impl Daemon {
         }
     }
 
-    fn print_status(&mut self) {
+    /// Logs what happened since the last status line. While no app reads the mic there is
+    /// nothing to say every minute, so a line that is not the engine's `last` waits until the
+    /// chain has run or playback could not be forwarded.
+    fn print_status(&mut self, last: bool) {
         let (Some(engine), Some(control)) = (&self.engine, &mut self.control) else {
             return;
         };
         let status = control.status();
         let stats = engine.stats();
+        let missing = stats.playback_missing.load(Ordering::Relaxed);
+        if !last && status.frames == self.seen.frames && missing == self.seen.missing {
+            return;
+        }
         let callbacks = stats.callbacks.load(Ordering::Relaxed);
         let ticks = stats.ticks.swap(0, Ordering::Relaxed);
         let max_ticks = stats.max_ticks.swap(0, Ordering::Relaxed);
@@ -445,7 +452,7 @@ impl Daemon {
         let seen = Seen {
             frames: status.frames,
             echo: status.echo,
-            missing: stats.playback_missing.load(Ordering::Relaxed),
+            missing,
         };
         let earlier = std::mem::replace(&mut self.seen, seen);
         let forwards = engine.forwards_playback();
@@ -459,7 +466,7 @@ impl Daemon {
             micros(max_ticks),
         );
         if seen.frames == earlier.frames {
-            // The chain did not run since the last line, so it has nothing new to say.
+            // The chain did not run since the last line.
             log!("no app read the mic; {io}; {playback}");
             return;
         }
