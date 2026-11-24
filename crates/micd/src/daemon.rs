@@ -45,6 +45,11 @@ const TICK: Duration = Duration::from_secs(1);
 const IDLE_CHECK: Duration = Duration::from_secs(30);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LAST_RETRY: Duration = Duration::from_secs(8);
+/// How long starts leave out the loopback after an engine with it stalled, before they try it
+/// again.
+const LOOPBACK_RETRY: Duration = Duration::from_secs(10 * 60);
+/// Why starts leave the loopback out in that time.
+const LOOPBACK_STALLED: &str = "the IOProc stalled with the loopback";
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Devices {
@@ -94,8 +99,8 @@ fn is_komplete(name: &str, transport: u32) -> bool {
     transport != kAudioDeviceTransportTypeAggregate && name.contains(KOMPLETE_NAME)
 }
 
-/// When to try starting the engine again after it failed to start.
-#[derive(Clone, Copy, PartialEq)]
+/// When to try starting the engine again after it failed to start or stalled.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Retry {
     Now,
     At(Instant),
@@ -122,7 +127,14 @@ struct Daemon {
     /// Set while the mic is closed and IO is still running.
     hold_until: Option<Instant>,
     retry: Retry,
+    /// How long the next failed start or stall puts the start after it off. It doubles each
+    /// time and starts over once an IOProc is seen running, or no app reads the mic.
     retry_delay: Duration,
+    /// Since when starts leave the loopback out: the IOProc of an engine with it stalled. The
+    /// mic matters more than the echo canceller, so the loopback is not tried again on every
+    /// rebuild. It is after `LOOPBACK_RETRY`, in case the stall had another cause, or as soon
+    /// as the devices change.
+    loopback_off: Option<Instant>,
     /// The last start failure that was logged, so a failure that repeats is logged once.
     last_error: Option<String>,
     /// The callback count the watchdog last saw, and when it last changed.
@@ -169,6 +181,7 @@ impl Daemon {
             hold_until: None,
             retry: Retry::Now,
             retry_delay: FIRST_RETRY,
+            loopback_off: None,
             last_error: None,
             progress: (0, now),
             status: (0, now),
@@ -202,6 +215,8 @@ impl Daemon {
             return false;
         }
         self.devices = found;
+        // New devices are worth another try with the loopback.
+        self.loopback_off = None;
         log!(
             "devices: Komplete {}, mic {}, feed {}, speakers {}, loopback {}",
             describe(found.komplete),
@@ -334,7 +349,8 @@ impl Daemon {
         // What a kept chain counted on the engines before this one.
         let before = control.status();
         let capture = Capture::requested(&self.config_dir);
-        match Engine::start(path, chain, capture, None) {
+        let skip_loopback = self.skip_loopback(Instant::now());
+        match Engine::start(path, chain, capture, skip_loopback) {
             Ok(engine) => {
                 let now = Instant::now();
                 if let Ok(delay) = engine.far_end() {
@@ -351,8 +367,9 @@ impl Daemon {
                     missing: 0,
                 };
                 self.base = (before.zero_frames_total, before.invalid_samples);
+                // The delay before the next retry stays until the watchdog sees the IOProc
+                // run, so an engine that starts and then stalls is not rebuilt at once.
                 self.retry = Retry::Now;
-                self.retry_delay = FIRST_RETRY;
                 self.last_error = None;
                 log!("running");
             }
@@ -365,10 +382,47 @@ impl Daemon {
                     log!("could not start: {error}; retrying until it works");
                     self.last_error = Some(error);
                 }
-                self.retry = Retry::At(Instant::now() + self.retry_delay);
-                self.retry_delay = (self.retry_delay * 2).min(LAST_RETRY);
+                self.back_off(Instant::now());
             }
         }
+    }
+
+    /// Puts the next start off, for twice as long each time up to `LAST_RETRY`.
+    fn back_off(&mut self, now: Instant) {
+        self.retry = Retry::At(now + self.retry_delay);
+        self.retry_delay = (self.retry_delay * 2).min(LAST_RETRY);
+    }
+
+    /// Why the next start leaves the loopback out, if it does.
+    fn skip_loopback(&mut self, now: Instant) -> Option<&'static str> {
+        let since = self.loopback_off?;
+        if now.duration_since(since) >= LOOPBACK_RETRY {
+            self.loopback_off = None;
+            return None;
+        }
+        Some(LOOPBACK_STALLED)
+    }
+
+    /// The watchdog: whether the IOProc, called `callbacks` times so far, has stopped being
+    /// called.
+    fn is_stalled(&mut self, callbacks: u64, now: Instant) -> bool {
+        if callbacks == self.progress.0 {
+            return now.duration_since(self.progress.1) >= STALL;
+        }
+        self.progress = (callbacks, now);
+        // The IOProc runs, so the next stall or failed start is the first again.
+        self.retry_delay = FIRST_RETRY;
+        false
+    }
+
+    /// What a stalled IOProc changes for the starts after it. The loopback may be what stalled
+    /// it, so they leave the loopback out for a while. And an engine that stalls is waited for
+    /// like one that fails to start, so one that stalls every time is not rebuilt every 2 s.
+    fn stalled(&mut self, had_loopback: bool, now: Instant) {
+        if had_loopback {
+            self.loopback_off = Some(now);
+        }
+        self.back_off(now);
     }
 
     fn stop(&mut self) {
@@ -395,17 +449,17 @@ impl Daemon {
             return;
         }
         let callbacks = engine.stats().callbacks.load(Ordering::Relaxed);
-        if callbacks != self.progress.0 {
-            self.progress = (callbacks, now);
-        } else if now.duration_since(self.progress.1) >= STALL {
+        let had_loopback = engine.far_end().is_ok();
+        if self.is_stalled(callbacks, now) {
             log!(
-                "the IOProc has not run for {} s; rebuilding",
-                STALL.as_secs()
+                "the IOProc has not run for {} s; rebuilding in {} s",
+                STALL.as_secs(),
+                self.retry_delay.as_secs()
             );
             self.stop();
+            self.stalled(had_loopback, now);
+            // A notification may have been lost. Devices that changed get the loopback again.
             self.refresh_devices();
-            self.retry = Retry::Now;
-            self.reconcile();
             return;
         }
         if let Some(control) = &mut self.control {
@@ -716,6 +770,85 @@ mod tests {
             "echo canceller active 25% of the time, removed 20.0 dB in far-end-only frames, \
              ERLE 18.3 dB, echo path at 8 ms after the reference"
         );
+    }
+
+    fn daemon() -> Daemon {
+        // Nothing here reads the directory.
+        let dir = PathBuf::from("/nonexistent/mic-dsp");
+        Daemon::new(Settings::new(&dir), dir)
+    }
+
+    /// After the IOProc of an engine with the loopback stalled, starts leave the loopback out
+    /// for ten minutes, and say why.
+    #[test]
+    fn a_stall_with_the_loopback_keeps_it_off_for_ten_minutes() {
+        let mut daemon = daemon();
+        let start = Instant::now();
+        assert_eq!(daemon.skip_loopback(start), None);
+
+        daemon.stalled(true, start);
+        for later in [0, 1, 60, 599] {
+            let now = start + Duration::from_secs(later);
+            assert_eq!(daemon.skip_loopback(now), Some(LOOPBACK_STALLED));
+        }
+        // Then the loopback gets another try, and stays on.
+        let later = start + LOOPBACK_RETRY;
+        assert_eq!(daemon.skip_loopback(later), None);
+        assert_eq!(daemon.skip_loopback(start + Duration::from_secs(1)), None);
+
+        // A stall of an engine that did not read the loopback says nothing about it.
+        daemon.stalled(false, later);
+        assert_eq!(daemon.skip_loopback(later), None);
+        // Each stall with the loopback starts the ten minutes again.
+        daemon.stalled(true, later);
+        daemon.stalled(true, later + Duration::from_secs(300));
+        let now = later + LOOPBACK_RETRY + Duration::from_secs(299);
+        assert_eq!(daemon.skip_loopback(now), Some(LOOPBACK_STALLED));
+        assert_eq!(daemon.skip_loopback(now + Duration::from_secs(1)), None);
+    }
+
+    /// What `Daemon::start` does to the watchdog when an engine starts at `now`.
+    fn started(daemon: &mut Daemon, now: Instant) {
+        daemon.progress = (0, now);
+        daemon.retry = Retry::Now;
+    }
+
+    /// An engine whose IOProc is never called is waited for like one that fails to start: 1 s,
+    /// then twice as long each time up to 8 s. Once an IOProc runs, the wait starts over.
+    #[test]
+    fn engines_that_stall_one_after_another_are_rebuilt_less_and_less_often() {
+        let second = Duration::from_secs(1);
+        let mut daemon = daemon();
+        let mut now = Instant::now();
+        for wait in [1, 2, 4, 8, 8, 8] {
+            started(&mut daemon, now);
+            assert!(!daemon.is_stalled(0, now + second));
+            now += STALL;
+            assert!(daemon.is_stalled(0, now));
+            daemon.stalled(true, now);
+            assert_eq!(daemon.retry, Retry::At(now + wait * second));
+            now += wait * second;
+        }
+
+        // This one runs, and stalls a minute later.
+        started(&mut daemon, now);
+        let mut callbacks = 0;
+        for _ in 0..60 {
+            now += second;
+            callbacks += 94;
+            assert!(!daemon.is_stalled(callbacks, now));
+        }
+        assert!(!daemon.is_stalled(callbacks, now + second));
+        now += STALL;
+        assert!(daemon.is_stalled(callbacks, now));
+        daemon.stalled(false, now);
+        assert_eq!(daemon.retry, Retry::At(now + second));
+
+        // Stalls and failed starts share the wait.
+        daemon.back_off(now);
+        assert_eq!(daemon.retry, Retry::At(now + 2 * second));
+        daemon.stalled(false, now);
+        assert_eq!(daemon.retry, Retry::At(now + 4 * second));
     }
 
     #[test]
