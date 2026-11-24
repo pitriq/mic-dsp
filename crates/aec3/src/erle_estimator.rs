@@ -7,6 +7,7 @@
 use crate::aec3_common::Spectrum;
 use crate::config::EchoCanceller3Config;
 use crate::fullband_erle_estimator::FullBandErleEstimator;
+use crate::state::persist;
 use crate::subband_erle_estimator::SubbandErleEstimator;
 
 pub(crate) struct ErleEstimator {
@@ -81,6 +82,12 @@ impl ErleEstimator {
             .get_inst_linear_quality_estimate()
     }
 }
+
+persist!(ErleEstimator {
+    fullband_erle_estimator,
+    subband_erle_estimator,
+    blocks_since_reset,
+});
 
 #[cfg(test)]
 mod tests {

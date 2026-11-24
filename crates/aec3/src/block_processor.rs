@@ -9,6 +9,7 @@ use crate::config::EchoCanceller3Config;
 use crate::echo_path_variability::{DelayAdjustment, EchoPathVariability};
 use crate::echo_remover::{EchoRemover, EchoRemoverMetrics};
 use crate::render_delay_buffer::RenderDelayBuffer;
+use crate::state::{check, Reader, State, StateError, Writer};
 
 pub(crate) struct BlockProcessor {
     render_buffer: RenderDelayBuffer,
@@ -56,6 +57,11 @@ impl BlockProcessor {
         self.echo_remover.set_voice(voice);
     }
 
+    /// Whether the canceller is still in AEC3's initial phase.
+    pub fn in_initial_state(&self) -> bool {
+        self.echo_remover.in_initial_state()
+    }
+
     /// Processes a block of capture data.
     pub fn process_capture(&mut self, capture_signal_saturation: bool, capture_block: &mut Block) {
         let mut echo_path_variability = EchoPathVariability {
@@ -83,5 +89,26 @@ impl BlockProcessor {
     /// Buffers a block of render data.
     pub fn buffer_render(&mut self, block: &Block) {
         self.render_buffer.insert(block);
+    }
+}
+
+/// The delay the state was learned at goes with it: the one given, and the one the last
+/// capture block was aligned with, which differ until a new delay has been applied. The render
+/// buffer itself is signal history. `load` is for a processor that has not run.
+impl State for BlockProcessor {
+    fn save(&self, w: &mut Writer) {
+        self.delay_blocks.save(w);
+        self.render_buffer.applied_delay().save(w);
+        self.echo_remover.save(w);
+    }
+
+    fn load(&mut self, r: &mut Reader<'_>) -> Result<(), StateError> {
+        let mut applied = None;
+        self.delay_blocks.load(r)?;
+        applied.load(r)?;
+        let max = self.render_buffer.max_delay();
+        check(self.delay_blocks <= max && applied.is_none_or(|delay| delay <= max))?;
+        self.render_buffer.start_aligned(applied);
+        self.echo_remover.load(r)
     }
 }

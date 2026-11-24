@@ -4,6 +4,9 @@ use crate::aec3_common::{BLOCK_SIZE, BLOCK_SIZE_LOG2, FFT_LENGTH_BY_2, NUM_BLOCK
 use crate::block::Block;
 use crate::config::EchoCanceller3Config;
 use crate::render_buffer::RenderBuffer;
+use crate::state::{
+    check, load_resizable, persist, save_resizable, Reader, State, StateError, Writer,
+};
 
 fn find_peak_index(
     filter_time_domain: &[f32],
@@ -214,6 +217,11 @@ impl FilterAnalyzer {
         self.filter_length_blocks
     }
 
+    /// The longest filter the analyzer was built for, in blocks.
+    pub fn max_filter_blocks(&self) -> usize {
+        self.h_highpass.capacity() / BLOCK_SIZE
+    }
+
     fn analyze_region(&mut self, filter_time_domain: &[f32], render_buffer: &RenderBuffer) {
         // Preprocess the filter to avoid issues with low-frequency components in the filter.
         self.pre_process_filter(filter_time_domain);
@@ -278,6 +286,54 @@ impl FilterAnalyzer {
         };
         r.end_sample =
             (r.start_sample + NUMBER_BLOCKS_TO_UPDATE * BLOCK_SIZE - 1).min(filter_size - 1);
+    }
+}
+
+persist!(ConsistentFilterDetector {
+    significant_peak,
+    filter_floor_accum,
+    filter_secondary_peak,
+    filter_floor_low_limit,
+    filter_floor_high_limit,
+    consistent_estimate_counter,
+    consistent_delay_reference,
+});
+
+impl State for FilterAnalyzer {
+    fn save(&self, w: &mut Writer) {
+        // One block of the high-passed filter is renewed per block, so it is saved whole.
+        save_resizable(&self.h_highpass, w);
+        self.blocks_since_reset.save(w);
+        self.region.start_sample.save(w);
+        self.region.end_sample.save(w);
+        self.gain.save(w);
+        self.peak_index.save(w);
+        self.filter_length_blocks.save(w);
+        self.consistent_estimate.save(w);
+        self.consistent_filter_detector.save(w);
+        self.filter_delay_blocks.save(w);
+    }
+
+    fn load(&mut self, r: &mut Reader<'_>) -> Result<(), StateError> {
+        load_resizable(&mut self.h_highpass, BLOCK_SIZE, r)?;
+        self.blocks_since_reset.load(r)?;
+        self.region.start_sample.load(r)?;
+        self.region.end_sample.load(r)?;
+        self.gain.load(r)?;
+        self.peak_index.load(r)?;
+        self.filter_length_blocks.load(r)?;
+        self.consistent_estimate.load(r)?;
+        self.consistent_filter_detector.load(r)?;
+        self.filter_delay_blocks.load(r)?;
+        // The detector subtracts its limits from the filter's length, and the delay is a
+        // block of the filter.
+        let len = self.h_highpass.len();
+        let detector = &self.consistent_filter_detector;
+        check(
+            detector.filter_floor_low_limit <= len
+                && detector.filter_floor_high_limit <= len
+                && self.filter_delay_blocks < self.max_filter_blocks(),
+        )
     }
 }
 

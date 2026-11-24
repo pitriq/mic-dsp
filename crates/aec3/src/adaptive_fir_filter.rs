@@ -4,6 +4,7 @@ use crate::aec3_common::{Spectrum, FFT_LENGTH, FFT_LENGTH_BY_2};
 use crate::aec3_fft::Aec3Fft;
 use crate::fft_data::FftData;
 use crate::render_buffer::RenderBuffer;
+use crate::state::persist;
 
 /// The render FFTs that the filter partitions multiply, newest first.
 fn render_partitions(
@@ -263,6 +264,24 @@ impl AdaptiveFirFilter {
         };
     }
 }
+
+// Every partition is saved, the ones beyond the current size too: they are zero, and the
+// filter grows into them.
+persist!(AdaptiveFirFilter {
+    current_size_partitions,
+    target_size_partitions,
+    old_target_size_partitions,
+    size_change_counter,
+    h,
+    partition_to_constrain,
+} valid: |filter| {
+    let sizes = 1..=filter.max_size_partitions;
+    sizes.contains(&filter.current_size_partitions)
+        && sizes.contains(&filter.target_size_partitions)
+        && sizes.contains(&filter.old_target_size_partitions)
+        && (0..=filter.size_change_duration_blocks).contains(&filter.size_change_counter)
+        && filter.partition_to_constrain < filter.current_size_partitions
+});
 
 #[cfg(test)]
 mod tests {

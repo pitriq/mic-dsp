@@ -2,6 +2,7 @@
 
 use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2, FFT_LENGTH_BY_2_PLUS_1};
 use crate::render_buffer::RenderBuffer;
+use crate::state::persist;
 
 const COUNTER_THRESHOLD: usize = 5;
 
@@ -135,6 +136,16 @@ impl RenderSignalAnalyzer {
         self.narrow_peak_band
     }
 }
+
+persist!(RenderSignalAnalyzer {
+    narrow_band_counters,
+    narrow_peak_band,
+    narrow_peak_counter,
+} valid: |analyzer| {
+    analyzer
+        .narrow_peak_band
+        .is_none_or(|band| band <= FFT_LENGTH_BY_2)
+});
 
 #[cfg(test)]
 mod tests {

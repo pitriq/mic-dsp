@@ -5,6 +5,7 @@
 //! classifier behind the field trial "WebRTC-Aec3TransparentModeHmm" is not ported.
 
 use crate::aec3_common::NUM_BLOCKS_PER_SECOND;
+use crate::state::persist;
 
 const BLOCKS_SINCE_CONVERGED_FILTER_INIT: usize = 10000;
 const BLOCKS_SINCE_CONSISTENT_ESTIMATE_INIT: usize = 10000;
@@ -128,6 +129,20 @@ impl TransparentMode {
         }
     }
 }
+
+persist!(TransparentMode {
+    capture_block_counter,
+    transparency_activated,
+    active_blocks_since_sane_filter,
+    sane_filter_observed,
+    finite_erl_recently_detected,
+    non_converged_sequence_size,
+    diverged_sequence_size,
+    active_non_converged_sequence_size,
+    num_converged_blocks,
+    recent_convergence_during_activity,
+    strong_not_saturated_render_blocks,
+});
 
 #[cfg(test)]
 mod tests {

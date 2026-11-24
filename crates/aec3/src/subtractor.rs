@@ -13,6 +13,7 @@ use crate::fft_data::FftData;
 use crate::refined_filter_update_gain::RefinedFilterUpdateGain;
 use crate::render_buffer::RenderBuffer;
 use crate::render_signal_analyzer::RenderSignalAnalyzer;
+use crate::state::{load_resizable, persist, save_resizable, Reader, State, StateError, Writer};
 use crate::subtractor_output::SubtractorOutput;
 
 /// Subtracts the filter's echo estimate `s_fft` from `y`, giving the error `e` and the
@@ -352,6 +353,44 @@ impl Subtractor {
         for a in &mut output.e_refined {
             *a = a.clamp(-32768.0, 32767.0);
         }
+    }
+}
+
+persist!(FilterMisadjustmentEstimator {
+    n_blocks_acum,
+    e2_acum,
+    y2_acum,
+    inv_misadjustment,
+    overhang,
+});
+
+impl State for Subtractor {
+    fn save(&self, w: &mut Writer) {
+        self.refined_filter.save(w);
+        self.coarse_filter.save(w);
+        self.refined_gain.save(w);
+        self.coarse_gain.save(w);
+        self.filter_misadjustment_estimator.save(w);
+        self.poor_coarse_filter_counter.save(w);
+        self.coarse_filter_reset_hangover.save(w);
+        // One partition of this estimate is renewed per block, so it is not the filter's
+        // inverse transform and has to be saved with it.
+        save_resizable(&self.refined_impulse_response, w);
+    }
+
+    fn load(&mut self, r: &mut Reader<'_>) -> Result<(), StateError> {
+        self.refined_filter.load(r)?;
+        self.coarse_filter.load(r)?;
+        self.refined_gain.load(r)?;
+        self.coarse_gain.load(r)?;
+        self.filter_misadjustment_estimator.load(r)?;
+        self.poor_coarse_filter_counter.load(r)?;
+        self.coarse_filter_reset_hangover.load(r)?;
+        load_resizable(&mut self.refined_impulse_response, FFT_LENGTH_BY_2, r)?;
+        // The frequency response is the filter's, as every block leaves it.
+        self.refined_filter
+            .compute_frequency_response(&mut self.refined_frequency_response);
+        Ok(())
     }
 }
 

@@ -1,6 +1,7 @@
 //! An exponential reverberant model that can be applied over power spectra (reverb_model.h/.cc).
 
 use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2_PLUS_1};
+use crate::state::persist;
 
 pub(crate) struct ReverbModel {
     reverb: Spectrum,
@@ -57,3 +58,5 @@ impl ReverbModel {
         }
     }
 }
+
+persist!(ReverbModel { reverb });

@@ -14,6 +14,8 @@
 //! `suppressor.conservative_hf_suppression` and `suppressor.use_subband_nearend_detection` are
 //! off; `erle.num_sections` is 1.
 
+use crate::state::persist;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RefinedConfiguration {
     pub length_blocks: usize,
@@ -282,3 +284,18 @@ impl Default for EchoCanceller3Config {
         }
     }
 }
+
+persist!(RefinedConfiguration {
+    length_blocks,
+    leakage_converged,
+    leakage_diverged,
+    error_floor,
+    error_ceil,
+    noise_gate,
+});
+
+persist!(CoarseConfiguration {
+    length_blocks,
+    rate,
+    noise_gate,
+});

@@ -3,6 +3,7 @@
 use crate::aec3_common::{
     Spectrum, FFT_LENGTH_BY_2, FFT_LENGTH_BY_2_MINUS_1, FFT_LENGTH_BY_2_PLUS_1,
 };
+use crate::state::persist;
 
 const MIN_ERL: f32 = 0.01;
 const MAX_ERL: f32 = 1000.0;
@@ -104,6 +105,14 @@ impl ErlEstimator {
         self.erl_time_domain
     }
 }
+
+persist!(ErlEstimator {
+    erl,
+    hold_counters,
+    erl_time_domain,
+    hold_counter_time_domain,
+    blocks_since_reset,
+});
 
 #[cfg(test)]
 mod tests {

@@ -7,6 +7,7 @@
 
 use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2, FFT_LENGTH_BY_2_PLUS_1};
 use crate::config::EchoCanceller3Config;
+use crate::state::persist;
 
 const X2_BAND_ENERGY_THRESHOLD: f32 = 44_015_068.0;
 const BLOCKS_TO_HOLD_ERLE: i32 = 100;
@@ -232,3 +233,15 @@ impl SubbandErleEstimator {
         st.num_points += 1;
     }
 }
+
+persist!(SubbandErleEstimator {
+    accum_spectra.y2,
+    accum_spectra.e2,
+    accum_spectra.low_render_energy,
+    accum_spectra.num_points,
+    erle,
+    erle_onset_compensated,
+    erle_unbounded,
+    coming_onset,
+    hold_counters,
+});

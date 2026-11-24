@@ -1,6 +1,7 @@
 //! Updates the frequency response for the reverb (reverb_frequency_response.h/.cc).
 
 use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2, FFT_LENGTH_BY_2_PLUS_1};
+use crate::state::persist;
 
 /// Computes the ratio of the energies between the direct path and the tail. The energy is
 /// computed in the power spectrum domain discarding the DC contributions.
@@ -75,3 +76,8 @@ impl ReverbFrequencyResponse {
         &self.tail_response
     }
 }
+
+persist!(ReverbFrequencyResponse {
+    average_decay,
+    tail_response,
+});

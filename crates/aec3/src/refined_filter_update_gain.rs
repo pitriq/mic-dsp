@@ -5,6 +5,7 @@ use crate::config::RefinedConfiguration;
 use crate::echo_path_variability::{DelayAdjustment, EchoPathVariability};
 use crate::fft_data::FftData;
 use crate::render_signal_analyzer::RenderSignalAnalyzer;
+use crate::state::persist;
 use crate::subtractor_output::SubtractorOutput;
 
 const H_ERROR_INITIAL: f32 = 10000.0;
@@ -171,3 +172,15 @@ impl RefinedFilterUpdateGain {
         }
     }
 }
+
+persist!(RefinedFilterUpdateGain {
+    current_config,
+    target_config,
+    old_target_config,
+    h_error,
+    poor_excitation_counter,
+    call_counter,
+    config_change_counter,
+} valid: |gain| {
+    (0..=gain.config_change_duration_blocks).contains(&gain.config_change_counter)
+});

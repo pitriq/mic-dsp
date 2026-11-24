@@ -5,6 +5,7 @@ use crate::aec_state::AecState;
 use crate::config::{EchoCanceller3Config, EchoModel};
 use crate::render_buffer::RenderBuffer;
 use crate::reverb_model::ReverbModel;
+use crate::state::persist;
 
 const DEFAULT_TRANSPARENT_MODE_GAIN: f32 = 0.01;
 
@@ -243,6 +244,12 @@ impl ResidualEchoEstimator {
         gain_amplitude * gain_amplitude
     }
 }
+
+persist!(ResidualEchoEstimator {
+    x2_noise_floor,
+    x2_noise_floor_counter,
+    echo_reverb,
+});
 
 #[cfg(test)]
 mod tests {

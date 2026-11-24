@@ -11,6 +11,7 @@ use crate::block::Block;
 use crate::config::{EchoCanceller3Config, Tuning};
 use crate::dominant_nearend_detector::DominantNearendDetector;
 use crate::moving_average::MovingAverage;
+use crate::state::persist;
 
 fn limit_low_frequency_gains(gain: &mut Spectrum) {
     // Limit the low frequency gains to avoid the impact of the high-pass filter on the
@@ -397,6 +398,15 @@ impl SuppressionGain {
         }
     }
 }
+
+// Without the average of the near end over the last blocks, which is signal history.
+persist!(SuppressionGain {
+    last_gain,
+    last_nearend,
+    last_echo,
+    low_render_detector.average_power,
+    dominant_nearend_detector,
+});
 
 #[cfg(test)]
 mod tests {

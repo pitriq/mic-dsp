@@ -46,6 +46,7 @@ mod reverb_decay_estimator;
 mod reverb_frequency_response;
 mod reverb_model;
 mod reverb_model_estimator;
+mod state;
 mod subband_erle_estimator;
 mod subtractor;
 mod subtractor_output;
@@ -61,7 +62,10 @@ use block_framer::BlockFramer;
 use block_processor::BlockProcessor;
 use config::EchoCanceller3Config;
 use frame_blocker::FrameBlocker;
+use state::{Reader, Sizes, State, Writer};
 use three_band_filter_bank::{Bands, ThreeBandFilterBank};
+
+pub use state::StateError;
 
 /// The only sample rate the canceller runs at.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -167,6 +171,8 @@ pub struct Metrics {
 
 /// The echo canceller. All its memory is allocated in [`EchoCanceller::new`].
 pub struct EchoCanceller {
+    /// What the canceller was built with, for the one `load` builds.
+    config: Config,
     render_filter_bank: ThreeBandFilterBank,
     capture_filter_bank: ThreeBandFilterBank,
     render_blocker: FrameBlocker,
@@ -227,6 +233,7 @@ impl EchoCanceller {
     pub fn new(delay: usize, config: Config) -> EchoCanceller {
         let internal = to_internal_config(config);
         EchoCanceller {
+            config,
             render_filter_bank: ThreeBandFilterBank::new(),
             capture_filter_bank: ThreeBandFilterBank::new(),
             render_blocker: FrameBlocker::new(),
@@ -318,6 +325,66 @@ impl EchoCanceller {
         for (o, v) in mic.iter_mut().zip(&fullband) {
             *o = v * (1.0 / INT16_SCALE);
         }
+    }
+
+    /// What the canceller has learned, for [`load`](Self::load): the two filters with the state
+    /// of their gains, the estimates of the echo path, of the room's reverb and of the noise,
+    /// the suppressor's state, the counters that tell AEC3 how far along it is, and the delay
+    /// all of it was learned at. The signal histories are left out: the render buffer, the
+    /// filter banks' memories, the framing and the overlap-add. `state.rs` has the format.
+    ///
+    /// Allocates. Not for the audio thread.
+    pub fn save(&self) -> Vec<u8> {
+        let mut w = Writer::new(self.sizes());
+        self.block_processor.save(&mut w);
+        w.finish()
+    }
+
+    /// Replaces what the canceller has learned with a saved state, and its signal histories
+    /// with a new canceller's. Given the same frames from then on, it puts out what the saved
+    /// canceller would have, had that one's signal histories been empty too; in practice,
+    /// what it would have put out after a pause.
+    ///
+    /// The delay becomes the one the state was saved with, because the filters are aligned to
+    /// it; a [`set_delay`](Self::set_delay) that moves it afterwards restarts them, as always.
+    /// The voice hint starts as not heard.
+    ///
+    /// After an error the canceller is as it was. A state is refused when it is not one, was
+    /// cut short or damaged, was saved by another version of the format or with other filter
+    /// lengths, or was saved before the canceller had left AEC3's initial phase
+    /// ([`is_trained`](Self::is_trained)), so a loaded canceller is never in that phase.
+    ///
+    /// Allocates and frees. Not for the audio thread.
+    pub fn load(&mut self, bytes: &[u8]) -> Result<(), StateError> {
+        let mut r = Reader::new(bytes, self.sizes())?;
+        // Loaded into a canceller of its own, so that an error leaves this one alone and
+        // whatever the state does not hold is a new canceller's.
+        let mut loaded = EchoCanceller::new(0, self.config);
+        loaded.block_processor.load(&mut r)?;
+        r.finish()?;
+        if !loaded.is_trained() {
+            return Err(StateError::Untrained);
+        }
+        *self = loaded;
+        Ok(())
+    }
+
+    /// Whether the canceller has left AEC3's initial phase: it has heard 2.5 s of far end
+    /// since it was made or since its delay last changed. Only then does [`load`](Self::load)
+    /// take its state.
+    pub fn is_trained(&self) -> bool {
+        !self.block_processor.in_initial_state()
+    }
+
+    /// The filter lengths that set the sizes of the arrays in a saved state.
+    fn sizes(&self) -> Sizes {
+        let filter = to_internal_config(self.config).filter;
+        [
+            filter.refined.length_blocks,
+            filter.coarse.length_blocks,
+            filter.refined_initial.length_blocks,
+            filter.coarse_initial.length_blocks,
+        ]
     }
 
     /// The canceller's view of the echo path.

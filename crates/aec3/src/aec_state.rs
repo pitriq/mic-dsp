@@ -16,6 +16,7 @@ use crate::filter_analyzer::FilterAnalyzer;
 use crate::render_buffer::RenderBuffer;
 use crate::reverb_model::ReverbModel;
 use crate::reverb_model_estimator::ReverbModelEstimator;
+use crate::state::persist;
 use crate::subtractor_output::SubtractorOutput;
 use crate::subtractor_output_analyzer::SubtractorOutputAnalyzer;
 use crate::transparent_mode::TransparentMode;
@@ -329,6 +330,11 @@ impl AecState {
         self.reverb_model_estimator.get_reverb_frequency_response()
     }
 
+    /// Whether the filters still use the parameters of the initial state.
+    pub fn in_initial_state(&self) -> bool {
+        self.initial_state.initial_state
+    }
+
     /// Returns whether the transition for going out of the initial stated has been triggered.
     pub fn transition_triggered(&self) -> bool {
         self.initial_state.transition_triggered
@@ -445,6 +451,30 @@ impl AecState {
         );
     }
 }
+
+persist!(AecState {
+    initial_state.transition_triggered,
+    initial_state.initial_state,
+    initial_state.strong_not_saturated_render_blocks,
+    delay_state.filter_delay_blocks,
+    transparent_state,
+    filter_quality_state.usable_linear_estimate,
+    filter_quality_state.filter_update_blocks_since_reset,
+    filter_quality_state.filter_update_blocks_since_start,
+    saturation_detector.saturated_echo,
+    erl_estimator,
+    erle_estimator,
+    strong_not_saturated_render_blocks,
+    capture_signal_saturation,
+    filter_analyzer,
+    reverb_model_estimator,
+    avg_render_reverb,
+    subtractor_output_analyzer,
+    active_render,
+} valid: |state| {
+    // The render buffer is read this many blocks back.
+    state.delay_state.filter_delay_blocks < state.filter_analyzer.max_filter_blocks()
+});
 
 #[cfg(test)]
 mod tests {

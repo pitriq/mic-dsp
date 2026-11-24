@@ -13,6 +13,7 @@ use crate::fft_data::FftData;
 use crate::render_buffer::RenderBuffer;
 use crate::render_signal_analyzer::RenderSignalAnalyzer;
 use crate::residual_echo_estimator::ResidualEchoEstimator;
+use crate::state::persist;
 use crate::subtractor::Subtractor;
 use crate::subtractor_output::SubtractorOutput;
 use crate::suppression_filter::SuppressionFilter;
@@ -109,6 +110,11 @@ impl EchoRemover {
             dominant_nearend: self.suppression_gain.is_dominant_nearend(),
             active_render: self.aec_state.active_render(),
         }
+    }
+
+    /// Whether the canceller is still in AEC3's initial phase.
+    pub fn in_initial_state(&self) -> bool {
+        self.aec_state.in_initial_state()
     }
 
     /// See [`DominantNearendDetector::set_voice`](crate::dominant_nearend_detector::DominantNearendDetector::set_voice).
@@ -292,3 +298,15 @@ impl EchoRemover {
         self.refined_filter_output_last_selected = use_refined_output;
     }
 }
+
+// Without the previous blocks of the two windows and the subtractor's output, which every
+// block writes before it reads.
+persist!(EchoRemover {
+    subtractor,
+    suppression_gain,
+    cng,
+    render_signal_analyzer,
+    residual_echo_estimator,
+    aec_state,
+    refined_filter_output_last_selected,
+});

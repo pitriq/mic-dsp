@@ -4,6 +4,7 @@ use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2_PLUS_1};
 use crate::config::CoarseConfiguration;
 use crate::fft_data::FftData;
 use crate::render_signal_analyzer::RenderSignalAnalyzer;
+use crate::state::persist;
 
 pub(crate) struct CoarseFilterUpdateGain {
     current_config: CoarseConfiguration,
@@ -130,3 +131,14 @@ impl CoarseFilterUpdateGain {
         }
     }
 }
+
+persist!(CoarseFilterUpdateGain {
+    current_config,
+    target_config,
+    old_target_config,
+    poor_signal_excitation_counter,
+    call_counter,
+    config_change_counter,
+} valid: |gain| {
+    (0..=gain.config_change_duration_blocks).contains(&gain.config_change_counter)
+});

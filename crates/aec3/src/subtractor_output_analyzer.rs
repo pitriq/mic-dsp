@@ -1,6 +1,7 @@
 //! Analyzes the properties of the subtractor output (subtractor_output_analyzer.h/.cc).
 
 use crate::aec3_common::BLOCK_SIZE;
+use crate::state::persist;
 use crate::subtractor_output::SubtractorOutput;
 
 /// What the subtractor output says about the filters for one block. WebRTC also reports a
@@ -51,3 +52,5 @@ impl SubtractorOutputAnalyzer {
         self.filter_converged = false;
     }
 }
+
+persist!(SubtractorOutputAnalyzer { filter_converged });

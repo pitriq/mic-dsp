@@ -3,6 +3,7 @@
 
 use crate::aec3_common::{fast_approx_log2f, Spectrum};
 use crate::config::Erle;
+use crate::state::persist;
 
 const EPSILON: f32 = 1e-3;
 const X2_BAND_ENERGY_THRESHOLD: f32 = 44_015_068.0;
@@ -191,3 +192,16 @@ impl FullBandErleEstimator {
         self.linear_filter_quality = self.instantaneous_erle.get_quality_estimate();
     }
 }
+
+persist!(FullBandErleEstimator {
+    hold_counter_instantaneous_erle,
+    erle_time_domain_log2,
+    instantaneous_erle.erle_log2,
+    instantaneous_erle.inst_quality_estimate,
+    instantaneous_erle.max_erle_log2,
+    instantaneous_erle.min_erle_log2,
+    instantaneous_erle.y2_acum,
+    instantaneous_erle.e2_acum,
+    instantaneous_erle.num_points,
+    linear_filter_quality,
+});

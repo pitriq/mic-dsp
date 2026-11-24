@@ -3,6 +3,7 @@
 
 use crate::aec3_common::Spectrum;
 use crate::config::DominantNearendDetection;
+use crate::state::persist;
 
 fn low_frequency_energy(spectrum: &Spectrum) -> f32 {
     spectrum[1..16].iter().fold(0.0, |acc, v| acc + v)
@@ -91,6 +92,13 @@ impl DominantNearendDetector {
         self.nearend_state = self.hold_counter > 0;
     }
 }
+
+// Without the voice hint, which the caller gives again.
+persist!(DominantNearendDetector {
+    nearend_state,
+    trigger_counter,
+    hold_counter,
+});
 
 #[cfg(test)]
 mod tests {

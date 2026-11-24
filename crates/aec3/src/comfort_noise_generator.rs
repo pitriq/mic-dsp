@@ -4,6 +4,7 @@
 use crate::aec3_common::{Spectrum, FFT_LENGTH_BY_2, FFT_LENGTH_BY_2_PLUS_1};
 use crate::config::EchoCanceller3Config;
 use crate::fft_data::FftData;
+use crate::state::persist;
 
 /// Computes the noise floor value that matches a WGN input of noise_floor_dbfs.
 fn get_noise_floor_factor(noise_floor_dbfs: f32) -> f32 {
@@ -157,6 +158,15 @@ impl ComfortNoiseGenerator {
         &self.n2
     }
 }
+
+// With the seed, so that a loaded canceller draws the noise the saved one would have.
+persist!(ComfortNoiseGenerator {
+    seed,
+    n2_initial,
+    y2_smoothed,
+    n2,
+    n2_counter,
+});
 
 #[cfg(test)]
 mod tests {

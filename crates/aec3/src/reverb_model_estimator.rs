@@ -4,6 +4,7 @@ use crate::aec3_common::Spectrum;
 use crate::config::EchoCanceller3Config;
 use crate::reverb_decay_estimator::ReverbDecayEstimator;
 use crate::reverb_frequency_response::ReverbFrequencyResponse;
+use crate::state::persist;
 
 pub(crate) struct ReverbModelEstimator {
     reverb_decay_estimator: ReverbDecayEstimator,
@@ -44,6 +45,11 @@ impl ReverbModelEstimator {
         self.reverb_frequency_response.frequency_response()
     }
 }
+
+// The decays are constants of the config.
+persist!(ReverbModelEstimator {
+    reverb_frequency_response,
+});
 
 #[cfg(test)]
 mod tests {

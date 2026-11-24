@@ -69,3 +69,37 @@ fn processing_never_allocates_with_long_filters() {
         ..Config::default()
     });
 }
+
+/// A canceller that took over a saved state runs on what `load` allocated.
+#[test]
+fn processing_never_allocates_after_a_load() {
+    let config = Config {
+        refined_blocks: 40,
+        ..Config::default()
+    };
+    let samples = 8 * SECOND;
+    let reference = speech_like(samples, 1, 0.2, 0);
+    let mut mic = mix(
+        &echo(&reference, &echo_path(480)),
+        &floor_noise(samples, 9, 0.0005),
+    );
+    let mut canceller = EchoCanceller::new(480, config);
+    let mut loaded = EchoCanceller::new(480, config);
+    let mut frames = |canceller: &mut EchoCanceller, from: usize, to: usize| {
+        assert_no_alloc(|| {
+            for i in from..to {
+                let r: &[f32; FRAME] = reference[i * FRAME..(i + 1) * FRAME].try_into().unwrap();
+                let m: &mut [f32; FRAME] =
+                    (&mut mic[i * FRAME..(i + 1) * FRAME]).try_into().unwrap();
+                canceller.render(r);
+                canceller.capture(m);
+            }
+        })
+    };
+    frames(&mut canceller, 0, 600);
+    // Saving and loading allocate, on the thread that does them.
+    let state = canceller.save();
+    loaded.load(&state).unwrap();
+    frames(&mut loaded, 600, 800);
+    assert!(loaded.is_trained() && loaded.metrics().converged);
+}

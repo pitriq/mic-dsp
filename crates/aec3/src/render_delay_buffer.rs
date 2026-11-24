@@ -81,6 +81,24 @@ impl RenderDelayBuffer {
     pub fn render_buffer(&self) -> &RenderBuffer {
         &self.buffer
     }
+
+    /// The largest delay the buffer aligns to.
+    pub fn max_delay(&self) -> usize {
+        self.max_delay
+    }
+
+    /// Not in WebRTC. Makes `delay` the delay already applied in a buffer nothing was
+    /// inserted into yet, for a canceller that takes over a saved state: its first capture
+    /// block is then aligned as the saved canceller's were, and is not taken for a new delay.
+    pub fn start_aligned(&mut self, delay: Option<usize>) {
+        debug_assert!(self.latency_blocks == 0 && self.buffer.read == self.buffer.write);
+        self.delay = delay;
+        if let Some(delay) = delay {
+            self.buffer.read = self
+                .buffer
+                .offset_index(self.buffer.write, delay.min(self.max_delay));
+        }
+    }
 }
 
 #[cfg(test)]
