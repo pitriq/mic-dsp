@@ -25,7 +25,7 @@ packaging/install-agent.sh    # load the LaunchAgent
 Then pick Francisco's Speakers as the output in System Settings > Sound. From then on everything the Mac plays goes through the daemon to the Komplete:
 
 - The volume keys work.
-- Sound reaches the Komplete about 18 ms later than it would directly. That number is worked out from what the devices report and is not measured yet.
+- Sound reaches the Komplete about 18 ms later than it would directly (856 frames, what the IOProc's timestamps show between its input and output).
 - Nothing plays while the daemon is not running or the Komplete is unplugged. To get sound without the daemon, pick the Komplete as the output again.
 - macOS is expected to show the orange mic indicator for mic-dsp whenever something plays, because the daemon reads the speakers' sound from an input device.
 
