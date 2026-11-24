@@ -12,7 +12,7 @@ use objc2_core_audio::{
     kAudioHardwarePropertyServiceRestarted,
 };
 
-use dsp::{Control, EchoStatus, Status};
+use dsp::{Chain, Control, EchoStatus, Status};
 
 use crate::capture::Capture;
 use crate::engine::{self, Engine, Failed};
@@ -95,7 +95,11 @@ struct Daemon {
     /// Listeners on device objects: (object, selector, event).
     listeners: Vec<(ObjectId, u32, u32)>,
     engine: Option<Engine>,
-    /// The handle to the engine's chain. Present exactly while `engine` is.
+    /// The chain while no engine runs on it. The first engine gets a new one, and each engine
+    /// that stops hands it on to the next, so the echo canceller keeps what it learned about
+    /// the room. An engine whose IOProc could not be shown to be gone keeps it.
+    chain: Option<Box<Chain>>,
+    /// The handle to that chain, wherever the chain is. `None` while there is no chain.
     control: Option<Control>,
     settings: Settings,
     /// Whether the chain last reported exact-zero input.
@@ -112,6 +116,10 @@ struct Daemon {
     status: (u64, Instant),
     /// What the last status line saw.
     seen: Seen,
+    /// The chain's exact-zero frames and invalid samples when the engine started. The chain
+    /// counts on from one engine to the next, and the status line counts from the engine's
+    /// start.
+    base: (u64, u64),
     nanos_per_tick: f64,
 }
 
@@ -139,6 +147,7 @@ impl Daemon {
             devices: Devices::default(),
             listeners: Vec::new(),
             engine: None,
+            chain: None,
             control: None,
             settings,
             input_dead: false,
@@ -149,6 +158,7 @@ impl Daemon {
             progress: (0, now),
             status: (0, now),
             seen: Seen::default(),
+            base: (0, 0),
             nanos_per_tick: io::nanos_per_tick(),
         }
     }
@@ -295,7 +305,19 @@ impl Daemon {
             return;
         };
         log!("the mic is in use; starting");
-        let (chain, mut control) = self.settings.chain();
+        let (chain, mut control) = match (self.chain.take(), self.control.take()) {
+            (Some(chain), Some(mut control)) => {
+                // A config that changed while no engine ran applies now.
+                self.settings.tick(&mut control);
+                (chain, control)
+            }
+            _ => {
+                log!("building a new chain; its echo canceller has yet to learn the room");
+                self.settings.chain()
+            }
+        };
+        // What a kept chain counted on the engines before this one.
+        let before = control.status();
         match Engine::start(path, chain, Capture::requested(&self.config_dir)) {
             Ok(engine) => {
                 let now = Instant::now();
@@ -304,18 +326,24 @@ impl Daemon {
                 }
                 self.engine = Some(engine);
                 self.control = Some(control);
-                self.input_dead = false;
+                self.input_dead = before.input_dead;
                 self.progress = (0, now);
                 self.status = (0, now + STATUS_INTERVAL);
-                self.seen = Seen::default();
+                self.seen = Seen {
+                    frames: before.frames,
+                    echo: before.echo,
+                    missing: 0,
+                };
+                self.base = (before.zero_frames_total, before.invalid_samples);
                 self.retry = Retry::Now;
                 self.retry_delay = FIRST_RETRY;
                 self.last_error = None;
                 log!("running");
             }
             Err(Failed { error, chain }) => {
-                // On the control thread, like every chain.
-                drop(chain);
+                // The chain waits for the next try, unless it was lost with its IOProc.
+                self.control = chain.is_some().then_some(control);
+                self.chain = chain;
                 let error = error.to_string();
                 if self.last_error.as_ref() != Some(&error) {
                     log!("could not start: {error}; retrying until it works");
@@ -332,10 +360,12 @@ impl Daemon {
         let Some(engine) = self.engine.take() else {
             return;
         };
-        // This stops IO and destroys the IOProc and the aggregate. The chain that comes back
-        // is dropped here, on the control thread.
-        drop(engine.stop());
-        self.control = None;
+        // This stops IO and destroys the IOProc and the aggregate. The chain comes back for
+        // the next engine, unless its IOProc may still run on it.
+        self.chain = engine.stop();
+        if self.chain.is_none() {
+            self.control = None;
+        }
         self.hold_until = None;
         log!("stopped");
     }
@@ -424,6 +454,8 @@ impl Daemon {
             }
             _ => "input speech p95 not measured yet".to_owned(),
         };
+        let (zero_frames, invalid_samples) = self.base;
+        let zero_frames = status.zero_frames_total.saturating_sub(zero_frames);
         log!(
             "gain {:+.1} dB, {speech}, input floor {:.1} dBFS; now: vad {:.2}, \
              gain reduction {:.1} dB (compressor), {:.1} dB (limiter), output peak {:.1} dBFS{flags}; \
@@ -438,9 +470,9 @@ impl Daemon {
             stats.frames.load(Ordering::Relaxed),
             micros(ticks) / count.max(1) as f64,
             micros(max_ticks),
-            status.zero_frames_total as f64 * dsp::FRAME as f64 / f64::from(dsp::SAMPLE_RATE),
+            zero_frames as f64 * dsp::FRAME as f64 / f64::from(dsp::SAMPLE_RATE),
             stats.skipped.load(Ordering::Relaxed),
-            status.invalid_samples,
+            status.invalid_samples.saturating_sub(invalid_samples),
         );
     }
 
@@ -653,6 +685,21 @@ mod tests {
             "echo canceller idle, no loopback buffer in 7 callbacks"
         );
         assert_eq!(describe_echo(None, &after, &after), "echo canceller idle");
+    }
+
+    /// A chain that ran on an earlier engine goes on counting. The first line of the next
+    /// engine reports what the canceller did on that engine alone.
+    #[test]
+    fn the_status_line_of_a_kept_chain_starts_from_what_the_chain_had_counted() {
+        let before = seen(5_760_000, 1_500, (900, 50.0, 0.5));
+        let same = seen(5_760_000 + 2_880_000, 1_500, (900, 50.0, 0.5));
+        assert_eq!(describe_echo(None, &same, &before), "echo canceller idle");
+        let more = seen(5_760_000 + 2_880_000, 3_000, (1_800, 150.0, 1.5));
+        assert_eq!(
+            describe_echo(None, &more, &before),
+            "echo canceller active 25% of the time, removed 20.0 dB in far-end-only frames, \
+             ERLE 18.3 dB, echo path at 8 ms after the reference"
+        );
     }
 
     #[test]

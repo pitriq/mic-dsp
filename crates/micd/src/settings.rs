@@ -93,7 +93,8 @@ impl Settings {
         (Box::new(chain), control)
     }
 
-    /// The periodic work while a chain runs: applies a changed config.
+    /// Applies a config that changed since the last look: every second while a chain runs, and
+    /// when a kept chain goes to a new engine.
     pub fn tick(&mut self, control: &mut Control) {
         if self.reload_config() {
             control.set_config(&self.config);
