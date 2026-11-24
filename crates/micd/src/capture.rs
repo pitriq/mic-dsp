@@ -4,6 +4,7 @@
 //! seconds (40, or the number the file holds, up to 120) into buffers allocated beforehand: the
 //! Komplete's channel 1, channel 1 of what the Mac plays (the loopback) and the feed's channel
 //! 1, plus the timestamps of every callback it stored frames from. It stops at that length.
+//! The buffers take 0.6 MB per second, about 23 MB for 40 s, for as long as the engine runs.
 //!
 //! Once the IOProc is gone the control thread writes them to
 //! `~/Library/Logs/mic-dsp/capture-<time>.wav` (three channels, 32-bit float) and `.csv`, and
@@ -43,8 +44,20 @@ pub struct Capture {
 // thread reads only after the IOProc is gone.
 unsafe impl Sync for Capture {}
 
+/// A buffer of `len` times `zero` whose pages are all in memory. `vec![zero; len]` alone gets
+/// zero pages that the system only maps when they are first written, and here that would be in
+/// the IOProc, as a page fault on the IO thread. The writes are volatile so that the compiler
+/// can't drop them for storing what is already there.
+fn mapped<T: Copy>(zero: T, len: usize) -> Box<[T]> {
+    let mut buffer = vec![zero; len].into_boxed_slice();
+    for item in buffer.iter_mut() {
+        unsafe { std::ptr::write_volatile(item, zero) };
+    }
+    buffer
+}
+
 impl Capture {
-    /// A capture when one is asked for, allocated here on the control thread.
+    /// A capture when one is asked for, allocated and paged in here on the control thread.
     pub fn requested(config_dir: &Path) -> Option<Box<Capture>> {
         let text = fs::read_to_string(config_dir.join("capture")).ok()?;
         let seconds = text
@@ -54,10 +67,8 @@ impl Capture {
             .clamp(1, MAX_SECONDS);
         let frames = seconds * dsp::SAMPLE_RATE as usize;
         Some(Box::new(Capture {
-            samples: UnsafeCell::new(vec![0.0; frames * STREAMS].into_boxed_slice()),
-            rows: UnsafeCell::new(
-                vec![([0.0; 4], 0); seconds * CALLBACKS_PER_SECOND].into_boxed_slice(),
-            ),
+            samples: UnsafeCell::new(mapped(0.0, frames * STREAMS)),
+            rows: UnsafeCell::new(mapped(([0.0; 4], 0), seconds * CALLBACKS_PER_SECOND)),
             frames: AtomicUsize::new(0),
             callbacks: AtomicUsize::new(0),
             config_dir: config_dir.to_owned(),
