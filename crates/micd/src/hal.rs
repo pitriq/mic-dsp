@@ -10,13 +10,14 @@ use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyIOProcStreamUsage,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
     kAudioDevicePropertyTransportType, kAudioHardwareBadPropertySizeError,
-    kAudioHardwarePropertyDevices, kAudioHardwarePropertyTranslateUIDToDevice,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyScopeInput, kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioObjectUnknown, kAudioStreamPropertyVirtualFormat, AudioDeviceIOProcID,
-    AudioHardwareIOProcStreamUsage, AudioObjectAddPropertyListener, AudioObjectGetPropertyData,
-    AudioObjectGetPropertyDataSize, AudioObjectID, AudioObjectPropertyAddress,
-    AudioObjectRemovePropertyListener, AudioObjectSetPropertyData,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
+    kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
+    kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
+    kAudioStreamPropertyVirtualFormat, AudioDeviceIOProcID, AudioHardwareIOProcStreamUsage,
+    AudioObjectAddPropertyListener, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
+    AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{
     kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
@@ -318,6 +319,11 @@ pub fn device_for_uid(uid: &str) -> Result<Option<ObjectId>> {
     };
     check_property(status, "get", kAudioHardwarePropertyTranslateUIDToDevice)?;
     Ok((device != kAudioObjectUnknown).then_some(device))
+}
+
+/// The device the Mac plays to.
+pub fn default_output() -> Result<ObjectId> {
+    get(SYSTEM, kAudioHardwarePropertyDefaultOutputDevice, GLOBAL)
 }
 
 /// How a device is connected: one of the `kAudioDeviceTransportType` constants.

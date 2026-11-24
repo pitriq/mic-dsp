@@ -302,6 +302,7 @@ impl Engine {
             drift.join(", "),
         );
         self.report_latency(plan, cycle_usage);
+        report_output();
         report_members(self.aggregate);
 
         hal::add_listener(aggregate, kAudioDevicePropertyDeviceIsAlive, wake::ALIVE)?;
@@ -908,6 +909,18 @@ fn float_channels(stream: ObjectId, what: &str) -> Result<u32, Error> {
             hal::describe_format(&format)
         ))
     })
+}
+
+/// Logs which device the Mac plays to. The loopback carries what plays only while that is the
+/// owner's Multi-Output Device, and micd does not check that it is.
+fn report_output() {
+    match hal::default_output().and_then(hal::name) {
+        Ok(name) => log!(
+            "the Mac's output is \"{name}\"; the loopback carries what plays only while that \
+             is the Multi-Output Device"
+        ),
+        Err(error) => log!("the Mac's output is unknown: {error}"),
+    }
 }
 
 /// Logs what each member of the aggregate reports about its timing, in frames: latency and
