@@ -1,8 +1,7 @@
 //! The IOProc and the state it shares with the control thread.
 //!
 //! The IOProc does no allocation, locking, system calls, logging or I/O. It owns `Realtime`
-//! outright and reports through the atomics in `Stats`. The control thread reads those and tells
-//! it whether an app reads the mic.
+//! outright and reports through the atomics in `Stats`, which is all the control thread reads.
 
 use std::cell::UnsafeCell;
 use std::ffi::c_void;
@@ -49,9 +48,9 @@ pub struct Stats {
     pub frames: AtomicU32,
     /// Callbacks that found no usable input or feed buffer.
     pub skipped: AtomicU64,
-    /// Callbacks that found no usable loopback buffer, or no usable Komplete output buffer,
-    /// although the engine forwards playback. Nothing plays in them.
-    pub playback_missing: AtomicU64,
+    /// Callbacks that found no usable loopback buffer although the aggregate carries the
+    /// loopback. The far end counts as silent in them.
+    pub reference_missing: AtomicU64,
     /// Time spent in the IOProc, in `mach_absolute_time` ticks, since the control thread last
     /// took it.
     pub ticks: AtomicU64,
@@ -62,43 +61,35 @@ pub struct Stats {
     pub in_callback: AtomicBool,
 }
 
-/// Where the IOProc finds its streams in the buffer lists the HAL hands it.
+/// Where the IOProc finds its streams in the buffer lists the HAL hands it. The Komplete's
+/// output stream is not among them: what the Mac plays reaches the Komplete without micd, and
+/// anything the IOProc wrote there would play on top of it.
 #[derive(Clone, Copy, Default)]
 pub struct Buffers {
     /// The Komplete's first input stream, in the input list.
     pub input: usize,
-    /// The feed's output stream, in the output list.
+    /// The loopback of Francisco's Speakers, in the input list, when the engine reads it as
+    /// the echo canceller's far end. Never the buffer `input` names.
+    pub loopback: Option<usize>,
+    /// The feed's output stream, in the output list. The only buffer the IOProc writes.
     pub feed: usize,
-    /// The way what the Mac plays takes, when the aggregate carries Francisco's Speakers.
-    pub route: Option<Route>,
-}
-
-/// The two ends of the playback the IOProc forwards.
-#[derive(Clone, Copy)]
-pub struct Route {
-    /// The loopback of Francisco's Speakers, in the input list. Never the buffer
-    /// `Buffers::input` names.
-    pub loopback: usize,
-    /// The Komplete's output stream, in the output list. Never the buffer `Buffers::feed` names.
-    pub output: usize,
 }
 
 /// What only the IO thread touches.
 struct Realtime {
-    chain: Chain,
-    /// Frames of the chain's output still to silence. After a rest the chain first puts out the
-    /// audio it held when the rest began.
+    /// Boxed, so it moves between the daemon and one engine after another without being copied.
+    chain: Box<Chain>,
+    /// Frames of the chain's output still to silence. A chain that ran on an earlier engine
+    /// first puts out the audio it held when that engine stopped, which is as long as its
+    /// latency. A new chain puts out none of the mic in that time anyway.
     stale: usize,
 }
 
-/// The IOProc's client data. The control thread creates it before the IOProc exists and drops it,
-/// and the chain with it, after the IOProc is stopped and destroyed.
+/// The IOProc's client data. The control thread creates it before the IOProc exists, and takes
+/// the chain back out of it or drops it after the IOProc is stopped and destroyed.
 pub struct Context {
     realtime: UnsafeCell<Realtime>,
     buffers: Buffers,
-    /// Whether an app reads the mic. While none does the chain rests and the IOProc only
-    /// forwards playback.
-    mic_in_use: AtomicBool,
     pub stats: Stats,
     /// A debug recording, when one was asked for.
     pub capture: Option<Box<Capture>>,
@@ -109,19 +100,16 @@ pub struct Context {
 unsafe impl Sync for Context {}
 
 impl Context {
-    pub fn new(chain: Chain, buffers: Buffers, capture: Option<Box<Capture>>) -> Box<Context> {
+    pub fn new(chain: Box<Chain>, buffers: Buffers, capture: Option<Box<Capture>>) -> Box<Context> {
         Box::new(Context {
-            realtime: UnsafeCell::new(Realtime { chain, stale: 0 }),
+            realtime: UnsafeCell::new(Realtime {
+                chain,
+                stale: Chain::LATENCY,
+            }),
             buffers,
-            mic_in_use: AtomicBool::new(true),
             stats: Stats::default(),
             capture,
         })
-    }
-
-    /// Tells the IOProc whether an app reads the mic. It applies from the next callback.
-    pub fn set_mic_in_use(&self, in_use: bool) {
-        self.mic_in_use.store(in_use, Ordering::Relaxed);
     }
 
     /// Changes where the streams are. The exclusive borrow means no IOProc is registered on the
@@ -135,10 +123,14 @@ impl Context {
         ptr::from_ref(self).cast_mut().cast()
     }
 
-    /// One IO cycle. What the Mac plays goes from the loopback to the Komplete's output as it
-    /// is. While an app reads the mic, Komplete channel 1 goes through the chain and into every
-    /// feed channel, with what the Mac plays as the far end for the echo canceller. While none
-    /// does, the feed gets silence.
+    /// The chain, for the next engine. Owning the context means no IOProc runs on it.
+    pub fn into_chain(self) -> Box<Chain> {
+        self.realtime.into_inner().chain
+    }
+
+    /// One IO cycle: Komplete channel 1 through the chain and into every feed channel, with
+    /// what the Mac plays, read from the loopback, as the far end for the echo canceller. The
+    /// feed's buffer is the only one it writes.
     ///
     /// # Safety
     ///
@@ -155,86 +147,62 @@ impl Context {
         let realtime = unsafe { &mut *self.realtime.get() };
         let source = unsafe { samples(input, self.buffers.input) };
         let feed = unsafe { samples(output, self.buffers.feed) };
+        // Without the loopback, or in a callback that has no buffer for it, the far end is
+        // silent.
+        let (played, played_channels): (&[f32], usize) = match self.buffers.loopback {
+            None => (&[], 1),
+            Some(index) => match unsafe { samples(input, index) } {
+                Some((played, channels)) => (played, channels),
+                None => {
+                    self.stats.reference_missing.fetch_add(1, Ordering::Relaxed);
+                    (&[], 1)
+                }
+            },
+        };
 
-        // The mic never goes to the Komplete's output: only the loopback does, or silence.
-        // Without the route, or in a callback that has no buffer for the loopback, nothing
-        // plays and the far end is silent.
-        let (mut played, mut played_channels): (&[f32], usize) = (&[], 1);
         let mut frames = 0;
-        if let Some(route) = self.buffers.route {
-            let loopback = unsafe { samples(input, route.loopback) };
-            let komplete = unsafe { samples(output, route.output) };
-            if loopback.is_none() || komplete.is_none() {
-                self.stats.playback_missing.fetch_add(1, Ordering::Relaxed);
-            }
-            if let Some((loopback, channels)) = loopback {
-                (played, played_channels) = (loopback, channels);
-            }
-            if let Some((komplete, channels)) = komplete {
-                frames = forward(played, played_channels, komplete, channels);
-            }
-        }
-
-        if !self.mic_in_use.load(Ordering::Relaxed) {
-            // The chain rests and the mic reads silence, but while something plays the echo
-            // canceller keeps learning the room, so it is ready when an app opens the mic.
-            realtime.stale = Chain::LATENCY;
-            if let (Some((source, source_channels)), false) = (source, played.is_empty()) {
-                let frames = (source.len() / source_channels).min(played.len() / played_channels);
-                realtime.chain.listen(
-                    &source[..frames * source_channels],
+        match (source, feed) {
+            (Some((source, source_channels)), Some((feed, feed_channels))) => {
+                frames = (source.len() / source_channels).min(feed.len() / feed_channels);
+                let source = &source[..frames * source_channels];
+                let (feed, rest) = feed.split_at_mut(frames * feed_channels);
+                realtime.chain.process_with_reference(
+                    source,
                     source_channels,
-                    &played[..frames * played_channels],
+                    played,
                     played_channels,
+                    feed,
+                    feed_channels,
                 );
-            }
-            if let Some((feed, _)) = feed {
-                feed.fill(0.0);
-            }
-        } else {
-            match (source, feed) {
-                (Some((source, source_channels)), Some((feed, feed_channels))) => {
-                    frames = (source.len() / source_channels).min(feed.len() / feed_channels);
-                    let source = &source[..frames * source_channels];
-                    let (feed, rest) = feed.split_at_mut(frames * feed_channels);
-                    realtime.chain.process_with_reference(
-                        source,
-                        source_channels,
-                        played,
-                        played_channels,
-                        feed,
-                        feed_channels,
+                let stale = realtime.stale.min(frames);
+                feed[..stale * feed_channels].fill(0.0);
+                realtime.stale -= stale;
+                rest.fill(0.0);
+                if let Some(capture) = &self.capture {
+                    let [now, input_time, output_time] = times;
+                    capture.record(
+                        [
+                            (source, source_channels),
+                            (played, played_channels),
+                            (&*feed, feed_channels),
+                        ],
+                        frames,
+                        [
+                            now.mSampleTime,
+                            input_time.mSampleTime,
+                            output_time.mSampleTime,
+                            input_time.mHostTime as f64,
+                            frames as f64,
+                        ],
                     );
-                    let stale = realtime.stale.min(frames);
-                    feed[..stale * feed_channels].fill(0.0);
-                    realtime.stale -= stale;
-                    rest.fill(0.0);
-                    if let Some(capture) = &self.capture {
-                        let [now, input_time, output_time] = times;
-                        capture.record(
-                            [
-                                (source, source_channels),
-                                (played, played_channels),
-                                (&*feed, feed_channels),
-                            ],
-                            frames,
-                            [
-                                now.mSampleTime,
-                                input_time.mSampleTime,
-                                output_time.mSampleTime,
-                                input_time.mHostTime as f64,
-                                frames as f64,
-                            ],
-                        );
-                    }
                 }
-                (None, Some((feed, _))) => {
-                    feed.fill(0.0);
-                    self.stats.skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {
-                    self.stats.skipped.fetch_add(1, Ordering::Relaxed);
-                }
+            }
+            (None, Some((feed, _))) => {
+                feed.fill(0.0);
+                self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                self.stats.skipped.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -245,28 +213,6 @@ impl Context {
         self.stats.callbacks.fetch_add(1, Ordering::Relaxed);
         self.stats.in_callback.store(false, Ordering::Release);
     }
-}
-
-/// Copies interleaved `played` to interleaved `out`, each channel to the channel of the same
-/// number as far as both have one, and puts silence in the channels and frames of `out` that
-/// are left. Returns the frames copied. Both channel counts are at least 1.
-fn forward(played: &[f32], played_channels: usize, out: &mut [f32], out_channels: usize) -> usize {
-    let frames = (played.len() / played_channels).min(out.len() / out_channels);
-    let (copied, rest) = out.split_at_mut(frames * out_channels);
-    if played_channels == out_channels {
-        copied.copy_from_slice(&played[..copied.len()]);
-    } else {
-        let shared = played_channels.min(out_channels);
-        let pairs = copied
-            .chunks_exact_mut(out_channels)
-            .zip(played.chunks_exact(played_channels));
-        for (to, from) in pairs {
-            to[..shared].copy_from_slice(&from[..shared]);
-            to[shared..].fill(0.0);
-        }
-    }
-    rest.fill(0.0);
-    frames
 }
 
 /// The interleaved Float32 samples of one buffer in a list and its channel count. `None` when
@@ -391,15 +337,15 @@ mod tests {
                 .collect()
         }
 
-        /// What the Mac plays, 2 channels that differ.
-        fn played(&mut self, frames: usize) -> Vec<f32> {
+        /// What the Mac plays, in channels that differ.
+        fn played(&mut self, frames: usize, channels: usize) -> Vec<f32> {
             (0..frames)
                 .flat_map(|_| {
                     self.phase += 0.03;
-                    [
-                        0.2 * (1.7 * self.phase).sin(),
-                        -0.1 * (0.4 * self.phase).cos(),
-                    ]
+                    let phase = self.phase;
+                    (0..channels).map(move |channel| {
+                        0.2 * ((1.7 - 0.6 * channel as f32) * phase).sin() / (1 + channel) as f32
+                    })
                 })
                 .collect()
         }
@@ -412,10 +358,10 @@ mod tests {
         let (chain, mut control) = dsp::chain(&dsp::Config::default());
         let buffers = Buffers {
             input: 0,
+            loopback: None,
             feed: 1,
-            route: None,
         };
-        let context = Context::new(chain, buffers, None);
+        let context = Context::new(Box::new(chain), buffers, None);
         let mut signals = Signals::default();
         let mut feed = vec![7.0f32; 2 * 600];
         for (round, frames) in [512usize, 512, 37, 600, 0, 512]
@@ -436,7 +382,7 @@ mod tests {
         let stats = &context.stats;
         assert_eq!(stats.callbacks.load(Ordering::Relaxed), 300);
         assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 0);
         let last = &feed[..2 * 512];
         assert!(last.chunks(2).all(|frame| frame[0] == frame[1]));
         assert!(last.iter().any(|&sample| sample != 0.0 && sample != 7.0));
@@ -448,188 +394,159 @@ mod tests {
 
     /// The aggregate with Francisco's Speakers: the Komplete's input and the loopback as input
     /// streams, the Komplete's output and the feed as output streams.
-    const ROUTED: Buffers = Buffers {
+    const WITH_LOOPBACK: Buffers = Buffers {
         input: 0,
+        loopback: Some(1),
         feed: 1,
-        route: Some(Route {
-            loopback: 1,
-            output: 0,
-        }),
     };
 
-    /// What plays goes to the Komplete's output channel by channel, and its mean is the echo
-    /// canceller's far end: the feed is what a second chain makes of the same mic with that
-    /// mean as a mono reference.
-    #[test]
-    fn the_io_proc_forwards_playback_and_gives_it_to_the_echo_canceller() {
-        let (chain, mut control) = dsp::chain(&dsp::Config::default());
-        let context = Context::new(chain, ROUTED, None);
-        let (mut twin, _twin_control) = dsp::chain(&dsp::Config::default());
-        let mut signals = Signals::default();
-        let mut komplete = vec![7.0f32; 2 * 512];
-        let mut feed = vec![7.0f32; 2 * 512];
-        let mut expected = vec![0.0f32; 2 * 512];
-        for _ in 0..150 {
-            let mut mic = signals.mic(512);
-            let mut played = signals.played(512);
+    /// What the HAL might leave in the Komplete's output buffer. Nothing may change it.
+    fn untouched(frames: usize) -> Vec<f32> {
+        (0..2 * frames).map(|i| 3.0 + i as f32).collect()
+    }
+
+    /// An engine on `chain`, next to a twin chain that gets the same audio in one piece. The
+    /// engine's feed must be the twin's output, except that every engine starts with silence for
+    /// the chain's latency.
+    struct Rig {
+        context: Box<Context>,
+        twin: Chain,
+        signals: Signals,
+        /// Frames this engine has put out.
+        frames: usize,
+    }
+
+    impl Rig {
+        fn new(chain: Box<Chain>, twin: Chain, signals: Signals) -> Rig {
+            Rig {
+                context: Context::new(chain, WITH_LOOPBACK, None),
+                twin,
+                signals,
+                frames: 0,
+            }
+        }
+
+        /// One callback of `frames` frames whose loopback buffer holds the first
+        /// `played_frames` frames of what plays, with `played_channels` channels, or is
+        /// switched off when that is 0. The HAL hands over a writable buffer for the
+        /// Komplete's output too.
+        fn run(&mut self, frames: usize, played_frames: usize, played_channels: usize) {
+            let mut mic = self.signals.mic(frames);
+            let mut played = self.signals.played(frames, played_channels.max(1));
+            let played = &mut played[..played_frames * played_channels];
+            let mut expected = vec![0.0f32; 2 * frames];
+            self.twin
+                .process_with_reference(&mic, 2, played, played_channels, &mut expected, 2);
+            let stale = Chain::LATENCY.saturating_sub(self.frames).min(frames);
+            expected[..2 * stale].fill(0.0);
+
+            let mut komplete = untouched(frames);
+            let mut feed = vec![7.0f32; 2 * frames];
+            let loopback = if played_channels == 0 {
+                OFF
+            } else {
+                buffer(played_channels as u32, played)
+            };
             call(
-                &context,
-                [buffer(2, &mut mic), buffer(2, &mut played)],
+                &self.context,
+                [buffer(2, &mut mic), loopback],
                 [buffer(2, &mut komplete), buffer(2, &mut feed)],
             );
-            // Exactly what played, so nothing of the mic.
-            assert!(komplete == played);
-            let mean: Vec<f32> = played.chunks(2).map(|f| (f[0] + f[1]) * 0.5).collect();
-            twin.process_with_reference(&mic, 2, &mean, 1, &mut expected, 2);
+            assert!(komplete == untouched(frames));
             assert!(feed == expected);
+            self.frames += frames;
         }
-        let heard = control.status().echo;
-        assert!(heard.active);
-        assert!(heard.active_frames > 140, "{}", heard.active_frames);
-        assert!(feed.iter().any(|&sample| sample != 0.0));
-        let stats = &context.stats;
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
-        assert_eq!(control.status().frames, 150 * 512);
     }
 
-    /// Loopbacks with other channel counts, and callbacks whose loopback or Komplete output
-    /// buffer is short, empty or missing. The Komplete's output is silent wherever nothing
-    /// played, and the mic goes through the chain every time.
+    /// The mean of what plays is the echo canceller's far end, and nothing of it goes anywhere
+    /// else: the IOProc leaves the Komplete's output buffer as it found it, although the HAL
+    /// hands one over.
     #[test]
-    fn the_io_proc_fills_the_komplete_output_whatever_the_loopback_holds() {
+    fn the_io_proc_gives_what_plays_to_the_echo_canceller_and_writes_only_the_feed() {
         let (chain, mut control) = dsp::chain(&dsp::Config::default());
-        let context = Context::new(chain, ROUTED, None);
-        let mut signals = Signals::default();
-        let mut komplete = vec![7.0f32; 2 * 512];
-        let mut feed = vec![7.0f32; 2 * 512];
-        let stats = &context.stats;
-
-        // A mono loopback plays on the first channel only.
-        let mut mono = vec![0.25f32; 512];
-        call(
-            &context,
-            [buffer(2, &mut signals.mic(512)), buffer(1, &mut mono)],
-            [buffer(2, &mut komplete), buffer(2, &mut feed)],
-        );
-        assert!(komplete.chunks(2).all(|frame| frame == [0.25, 0.0]));
-
-        // A third channel has nowhere to go.
-        let mut wide: Vec<f32> = (0..512).flat_map(|_| [0.1, 0.2, 0.3]).collect();
-        komplete.fill(7.0);
-        call(
-            &context,
-            [buffer(2, &mut signals.mic(512)), buffer(3, &mut wide)],
-            [buffer(2, &mut komplete), buffer(2, &mut feed)],
-        );
-        assert!(komplete.chunks(2).all(|frame| frame == [0.1, 0.2]));
-
-        // Shorter than the output's buffer, then empty: silence for the rest.
-        let mut played = signals.played(512);
-        komplete.fill(7.0);
-        call(
-            &context,
-            [
-                buffer(2, &mut signals.mic(512)),
-                buffer(2, &mut played[..2 * 100]),
-            ],
-            [buffer(2, &mut komplete), buffer(2, &mut feed)],
-        );
-        assert!(komplete[..2 * 100] == played[..2 * 100]);
-        assert!(komplete[2 * 100..].iter().all(|&sample| sample == 0.0));
-        komplete.fill(7.0);
-        call(
-            &context,
-            [
-                buffer(2, &mut signals.mic(512)),
-                buffer(2, &mut played[..0]),
-            ],
-            [buffer(2, &mut komplete), buffer(2, &mut feed)],
-        );
-        assert!(komplete.iter().all(|&sample| sample == 0.0));
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 0);
-
-        // No loopback buffer: silence plays.
-        komplete.fill(7.0);
-        call(
-            &context,
-            [buffer(2, &mut signals.mic(512)), OFF],
-            [buffer(2, &mut komplete), buffer(2, &mut feed)],
-        );
-        assert!(komplete.iter().all(|&sample| sample == 0.0));
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 1);
-
-        // No Komplete output buffer: there is nowhere to play, and the chain still runs.
-        call(
-            &context,
-            [buffer(2, &mut signals.mic(512)), buffer(2, &mut played)],
-            [OFF, buffer(2, &mut feed)],
-        );
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 2);
-
-        assert_eq!(stats.callbacks.load(Ordering::Relaxed), 6);
+        let (twin, mut twin_control) = dsp::chain(&dsp::Config::default());
+        let mut rig = Rig::new(Box::new(chain), twin, Signals::default());
+        for _ in 0..150 {
+            rig.run(512, 512, 2);
+        }
+        let status = control.status();
+        assert!(status.echo.active);
+        assert!(status.echo.active_frames > 140, "{:?}", status.echo);
+        assert_eq!(status.echo, twin_control.status().echo);
+        assert_eq!(status.frames, 150 * 512);
+        assert!(status.out_peak_dbfs > -60.0, "{}", status.out_peak_dbfs);
+        let stats = &rig.context.stats;
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 0);
         assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
-        assert_eq!(control.status().frames, 6 * 512);
-        assert!(feed.chunks(2).all(|frame| frame[0] == frame[1]));
     }
 
-    /// While no app reads the mic the IOProc still forwards what plays, only the echo canceller
-    /// runs and the feed is silent. When an app comes back, the audio the chain held from
-    /// before stays in: the feed is silent for the chain's latency and then carries the mic.
+    /// Loopbacks with other channel counts, and callbacks whose loopback buffer is short, empty
+    /// or missing. The far end is silent wherever nothing came, and the mic goes through the
+    /// chain every time.
     #[test]
-    fn with_no_app_on_the_mic_the_io_proc_only_forwards_playback() {
+    fn the_io_proc_runs_the_chain_whatever_the_loopback_holds() {
         let (chain, mut control) = dsp::chain(&dsp::Config::default());
-        let context = Context::new(chain, ROUTED, None);
-        let mut signals = Signals::default();
-        let mut komplete = vec![7.0f32; 2 * 512];
-        let mut feed = vec![7.0f32; 2 * 512];
-        let mut run = |komplete: &mut [f32], feed: &mut [f32]| {
-            let mut mic = signals.mic(512);
-            let mut played = signals.played(512);
-            feed.fill(7.0);
-            call(
-                &context,
-                [buffer(2, &mut mic), buffer(2, &mut played)],
-                [buffer(2, komplete), buffer(2, feed)],
-            );
-            assert!(komplete == played);
-        };
-
-        for _ in 0..100 {
-            run(&mut komplete, &mut feed);
+        let (twin, _twin_control) = dsp::chain(&dsp::Config::default());
+        let mut rig = Rig::new(Box::new(chain), twin, Signals::default());
+        for _ in 0..4 {
+            rig.run(512, 512, 2);
         }
-        assert!(feed.iter().any(|&sample| sample != 0.0));
+        // Mono, three channels, shorter than the mic's buffer, empty.
+        rig.run(512, 512, 1);
+        rig.run(512, 512, 3);
+        rig.run(512, 100, 2);
+        rig.run(512, 0, 2);
+        let stats = &rig.context.stats;
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 0);
+        // No loopback buffer at all.
+        rig.run(512, 0, 0);
+        let stats = &rig.context.stats;
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 1);
+        rig.run(512, 512, 2);
+
+        let stats = &rig.context.stats;
+        assert_eq!(stats.callbacks.load(Ordering::Relaxed), 10);
+        assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.reference_missing.load(Ordering::Relaxed), 1);
+        assert_eq!(control.status().frames, 10 * 512);
+    }
+
+    /// The daemon keeps the chain when an engine stops and hands it to the next one. The second
+    /// engine's feed is what one uninterrupted chain puts out, bit for bit, after silence for
+    /// the chain's latency in place of the audio the chain held from the first engine.
+    #[test]
+    fn a_chain_kept_for_the_next_engine_carries_on_after_silence_for_its_latency() {
+        let (chain, mut control) = dsp::chain(&dsp::Config::default());
+        let (twin, mut twin_control) = dsp::chain(&dsp::Config::default());
+        let mut first = Rig::new(Box::new(chain), twin, Signals::default());
+        for _ in 0..149 {
+            first.run(512, 512, 2);
+        }
+        // The engine stops in the middle of one of the chain's frames.
+        first.run(300, 300, 2);
         let before = control.status();
-        assert_eq!(before.frames, 100 * 512);
+        assert_eq!(before.frames, 149 * 512 + 300);
+        assert!(before.echo.active);
 
-        context.set_mic_in_use(false);
-        for _ in 0..50 {
-            run(&mut komplete, &mut feed);
-            assert!(feed.iter().all(|&sample| sample == 0.0));
+        let Rig {
+            context,
+            twin,
+            signals,
+            ..
+        } = first;
+        let mut second = Rig::new(context.into_chain(), twin, signals);
+        // `run` checks the silence and the audio after it: the latency is two callbacks and
+        // part of a third.
+        const { assert!(Chain::LATENCY > 2 * 512 && Chain::LATENCY < 3 * 512) };
+        for _ in 0..60 {
+            second.run(512, 512, 2);
         }
-        // The echo canceller keeps learning while the far end plays; nothing reaches the feed.
-        let resting = control.status();
-        assert_eq!(resting.frames, before.frames + 50 * 512);
-        assert!(resting.echo.active_frames > before.echo.active_frames);
-        let stats = &context.stats;
-        assert_eq!(stats.frames.load(Ordering::Relaxed), 512);
-
-        context.set_mic_in_use(true);
-        let mut resumed = Vec::new();
-        for _ in 0..6 {
-            run(&mut komplete, &mut feed);
-            resumed.extend(feed.chunks(2).map(|frame| frame[0]));
-        }
-        assert!(resumed[..Chain::LATENCY]
-            .iter()
-            .all(|&sample| sample == 0.0));
-        assert!(resumed[Chain::LATENCY..]
-            .iter()
-            .any(|&sample| sample != 0.0));
-        assert_eq!(control.status().frames, before.frames + 56 * 512);
-
-        assert_eq!(stats.callbacks.load(Ordering::Relaxed), 156);
-        assert_eq!(stats.skipped.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.playback_missing.load(Ordering::Relaxed), 0);
+        let after = control.status();
+        assert_eq!(after.frames, before.frames + 60 * 512);
+        // The echo canceller is the one that ran before, with what it had learned.
+        assert_eq!(after.echo, twin_control.status().echo);
+        assert_eq!(after.echo.active_frames, before.echo.active_frames + 64);
+        assert!(after.out_peak_dbfs > -60.0, "{}", after.out_peak_dbfs);
+        assert_eq!(second.context.stats.callbacks.load(Ordering::Relaxed), 60);
     }
 }

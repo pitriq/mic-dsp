@@ -85,10 +85,12 @@ impl Settings {
         }
     }
 
-    /// A chain for a new engine, with the current config.
-    pub fn chain(&mut self) -> (Chain, Control) {
+    /// A new chain with the current config, boxed so that handing it to an engine and taking it
+    /// back copies nothing.
+    pub fn chain(&mut self) -> (Box<Chain>, Control) {
         self.reload_config();
-        dsp::chain(&self.config)
+        let (chain, control) = dsp::chain(&self.config);
+        (Box::new(chain), control)
     }
 
     /// The periodic work while a chain runs: applies a changed config.

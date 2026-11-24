@@ -15,7 +15,7 @@ use objc2_core_audio::{
 use dsp::{Control, EchoStatus, Status};
 
 use crate::capture::Capture;
-use crate::engine::{self, Engine};
+use crate::engine::{self, Engine, Failed};
 use crate::hal::{self, ObjectId};
 use crate::permission::{self, Permission};
 use crate::settings::{self, Settings};
@@ -27,12 +27,13 @@ const KOMPLETE_NAME: &str = "Komplete Audio 1";
 const MIC_UID: &str = "MicDSP_UID";
 /// The hidden, output-only device whose output is the visible mic's input.
 const FEED_UID: &str = "MicDSP_2_UID";
-/// The visible, output-only "Francisco's Speakers", which the Mac plays to.
+/// The visible, output-only "Francisco's Speakers". The owner's Multi-Output Device plays to it
+/// next to the Komplete. micd never opens it.
 const SPEAKERS_UID: &str = "MicDSPSpeakers_UID";
 /// The hidden, input-only device whose input is what the speakers were given.
 const LOOPBACK_UID: &str = "MicDSPSpeakers_2_UID";
 
-/// How long IO keeps running after the last app closed the mic and the last one stopped playing.
+/// How long IO keeps running after the last app closes the mic.
 const HOLD: Duration = Duration::from_secs(7);
 /// How long the IOProc may go without being called before the engine is rebuilt.
 const STALL: Duration = Duration::from_secs(2);
@@ -66,29 +67,15 @@ impl Devices {
         }
     }
 
-    /// Francisco's Speakers and its loopback. They are one driver, so one without the other
-    /// counts as neither.
-    fn route(&self) -> Option<(ObjectId, ObjectId)> {
-        Some((self.speakers?, self.loopback?))
-    }
-
+    /// What an engine is built from. The loopback is optional: without it the mic works and
+    /// the echo canceller has no far end.
     fn path(&self) -> Option<engine::Path> {
         Some(engine::Path {
             komplete: self.komplete?,
             feed: self.feed?,
             mic: self.mic?,
-            loopback: self.route().map(|(_, loopback)| loopback),
+            loopback: self.loopback,
         })
-    }
-
-    /// Whether an app reads the mic, and whether one plays to Francisco's Speakers. micd's own
-    /// IO counts for neither: it runs on the feed and the loopback, not on the visible devices.
-    fn in_use(&self) -> (bool, bool) {
-        let mic = self.mic.is_some_and(hal::is_running_somewhere);
-        let playing = self
-            .route()
-            .is_some_and(|(speakers, _)| hal::is_running_somewhere(speakers));
-        (mic, playing)
     }
 }
 
@@ -113,10 +100,7 @@ struct Daemon {
     settings: Settings,
     /// Whether the chain last reported exact-zero input.
     input_dead: bool,
-    /// Whether the engine was last told that an app reads the mic. While none does it only
-    /// forwards playback.
-    mic_in_use: bool,
-    /// Set while nothing needs the engine and IO is still running.
+    /// Set while the mic is closed and IO is still running.
     hold_until: Option<Instant>,
     retry: Retry,
     retry_delay: Duration,
@@ -137,7 +121,7 @@ struct Seen {
     /// Sample frames the chain had consumed.
     frames: u64,
     echo: EchoStatus,
-    /// Callbacks that could not forward playback.
+    /// Callbacks that had no buffer for the loopback.
     missing: u64,
 }
 
@@ -158,7 +142,6 @@ impl Daemon {
             control: None,
             settings,
             input_dead: false,
-            mic_in_use: false,
             hold_until: None,
             retry: Retry::Now,
             retry_delay: FIRST_RETRY,
@@ -202,11 +185,8 @@ impl Daemon {
             describe(found.speakers),
             describe(found.loopback)
         );
-        if found.route().is_none() {
-            log!(
-                "Francisco's Speakers is not installed: playback is not forwarded and the echo \
-                 canceller has no far end"
-            );
+        if found.loopback.is_none() {
+            log!("Francisco's Speakers is not installed: the echo canceller has no far end");
         }
         self.remove_device_listeners();
         let wanted = [
@@ -214,11 +194,6 @@ impl Daemon {
                 found.mic,
                 kAudioDevicePropertyDeviceIsRunningSomewhere,
                 wake::MIC_RUNNING,
-            ),
-            (
-                found.route().map(|(speakers, _)| speakers),
-                kAudioDevicePropertyDeviceIsRunningSomewhere,
-                wake::PLAYING,
             ),
             (
                 found.komplete,
@@ -276,46 +251,36 @@ impl Daemon {
         }
     }
 
-    /// Brings the engine in line with whether an app reads the mic and whether one plays. The
-    /// engine runs while either does. Its chain runs only while an app reads the mic.
+    /// Brings the engine in line with whether an app is reading the mic.
     fn reconcile(&mut self) {
-        let (mic, playing) = self.devices.in_use();
+        let wanted = self.devices.mic.is_some_and(hal::is_running_somewhere);
         let now = Instant::now();
-        match (&self.engine, mic || playing) {
-            (Some(engine), true) => {
+        match (self.engine.is_some(), wanted) {
+            (true, true) => {
                 if self.hold_until.take().is_some() {
-                    log!("{}; not stopping", describe_use(mic));
-                }
-                if mic != self.mic_in_use {
-                    self.mic_in_use = mic;
-                    engine.set_mic_in_use(mic);
-                    if mic {
-                        log!("the mic is in use; running the chain");
-                    } else {
-                        log!("the mic is no longer in use; forwarding playback only");
-                    }
+                    log!("the mic is in use again");
                 }
             }
-            (Some(_), false) => {
+            (true, false) => {
                 if self.hold_until.is_none() {
                     log!(
-                        "no app reads the mic or plays; stopping in {} s",
+                        "the mic is no longer in use; stopping in {} s",
                         HOLD.as_secs()
                     );
                     self.hold_until = Some(now + HOLD);
                 }
             }
-            (None, true) => {
+            (false, true) => {
                 let due = match self.retry {
                     Retry::Now => true,
                     Retry::At(time) => now >= time,
                     Retry::WhenDevicesChange => false,
                 };
                 if due {
-                    self.start(mic);
+                    self.start();
                 }
             }
-            (None, false) => {
+            (false, false) => {
                 self.retry = Retry::Now;
                 self.retry_delay = FIRST_RETRY;
                 self.last_error = None;
@@ -323,40 +288,34 @@ impl Daemon {
         }
     }
 
-    /// Starts the engine: with the chain running if an app reads the mic, and forwarding
-    /// playback only if not.
-    fn start(&mut self, mic: bool) {
-        let why = describe_use(mic);
+    fn start(&mut self) {
         let Some(path) = self.devices.path() else {
-            log!("{why}, but a device is missing; waiting for it");
+            log!("the mic is in use, but a device is missing; waiting for it");
             self.retry = Retry::WhenDevicesChange;
             return;
         };
-        log!("{why}; starting");
+        log!("the mic is in use; starting");
         let (chain, mut control) = self.settings.chain();
-        match Engine::start(path, chain, mic, Capture::requested(&self.config_dir)) {
+        match Engine::start(path, chain, Capture::requested(&self.config_dir)) {
             Ok(engine) => {
                 let now = Instant::now();
-                if let Some(delay) = engine.echo_delay() {
+                if let Ok(delay) = engine.far_end() {
                     control.set_echo_delay(delay);
                 }
                 self.engine = Some(engine);
                 self.control = Some(control);
                 self.input_dead = false;
-                self.mic_in_use = mic;
                 self.progress = (0, now);
                 self.status = (0, now + STATUS_INTERVAL);
                 self.seen = Seen::default();
                 self.retry = Retry::Now;
                 self.retry_delay = FIRST_RETRY;
                 self.last_error = None;
-                if mic {
-                    log!("running");
-                } else {
-                    log!("running, forwarding playback only");
-                }
+                log!("running");
             }
-            Err(error) => {
+            Err(Failed { error, chain }) => {
+                // On the control thread, like every chain.
+                drop(chain);
                 let error = error.to_string();
                 if self.last_error.as_ref() != Some(&error) {
                     log!("could not start: {error}; retrying until it works");
@@ -369,15 +328,16 @@ impl Daemon {
     }
 
     fn stop(&mut self) {
-        if self.engine.is_some() {
-            self.print_status(true);
-            // Dropping the engine stops IO and destroys the IOProc and the aggregate, then frees
-            // the chain.
-            self.engine = None;
-            self.control = None;
-            self.hold_until = None;
-            log!("stopped");
-        }
+        self.print_status();
+        let Some(engine) = self.engine.take() else {
+            return;
+        };
+        // This stops IO and destroys the IOProc and the aggregate. The chain that comes back
+        // is dropped here, on the control thread.
+        drop(engine.stop());
+        self.control = None;
+        self.hold_until = None;
+        log!("stopped");
     }
 
     /// The timed work: the hold, the watchdog, the config and the status line.
@@ -408,7 +368,7 @@ impl Daemon {
             self.watch_input(&status);
         }
         if now >= self.status.1 {
-            self.print_status(false);
+            self.print_status();
             self.status.1 = now + STATUS_INTERVAL;
         }
     }
@@ -431,19 +391,12 @@ impl Daemon {
         }
     }
 
-    /// Logs what happened since the last status line. While no app reads the mic there is
-    /// nothing to say every minute, so a line that is not the engine's `last` waits until the
-    /// chain has run or playback could not be forwarded.
-    fn print_status(&mut self, last: bool) {
+    fn print_status(&mut self) {
         let (Some(engine), Some(control)) = (&self.engine, &mut self.control) else {
             return;
         };
         let status = control.status();
         let stats = engine.stats();
-        let missing = stats.playback_missing.load(Ordering::Relaxed);
-        if !last && status.frames == self.seen.frames && missing == self.seen.missing {
-            return;
-        }
         let callbacks = stats.callbacks.load(Ordering::Relaxed);
         let ticks = stats.ticks.swap(0, Ordering::Relaxed);
         let max_ticks = stats.max_ticks.swap(0, Ordering::Relaxed);
@@ -452,25 +405,11 @@ impl Daemon {
         let seen = Seen {
             frames: status.frames,
             echo: status.echo,
-            missing,
+            missing: stats.reference_missing.load(Ordering::Relaxed),
         };
-        let earlier = std::mem::replace(&mut self.seen, seen);
-        let forwards = engine.forwards_playback();
-        let (_, playing) = self.devices.in_use();
-        let playback = describe_playback(forwards, playing, seen.missing - earlier.missing);
+        let echo = describe_echo(engine.far_end().err(), &seen, &self.seen);
+        self.seen = seen;
         let micros = |ticks: u64| ticks as f64 * self.nanos_per_tick / 1e3;
-        let io = format!(
-            "{callbacks} callbacks (+{count}) of {} frames, processing mean {:.1} µs, max {:.1} µs",
-            stats.frames.load(Ordering::Relaxed),
-            micros(ticks) / count.max(1) as f64,
-            micros(max_ticks),
-        );
-        if seen.frames == earlier.frames {
-            // The chain did not run since the last line.
-            log!("no app read the mic; {io}; {playback}");
-            return;
-        }
-        let echo = describe_echo(forwards, &seen, &earlier);
         let flags: String = [
             (status.input_dead, ", input dead"),
             (status.clipping, ", clipping"),
@@ -488,13 +427,17 @@ impl Daemon {
         log!(
             "gain {:+.1} dB, {speech}, input floor {:.1} dBFS; now: vad {:.2}, \
              gain reduction {:.1} dB (compressor), {:.1} dB (limiter), output peak {:.1} dBFS{flags}; \
-             {io}; {:.1} s of exact-zero input, {} skipped, {} invalid samples; {echo}; {playback}",
+             {callbacks} callbacks (+{count}) of {} frames, processing mean {:.1} µs, max {:.1} µs; \
+             {:.1} s of exact-zero input, {} skipped, {} invalid samples; {echo}",
             status.gain_db,
             status.input_floor_dbfs,
             status.vad,
             status.comp_gr_db.abs(),
             status.limiter_gr_db.abs(),
             status.out_peak_dbfs,
+            stats.frames.load(Ordering::Relaxed),
+            micros(ticks) / count.max(1) as f64,
+            micros(max_ticks),
             status.zero_frames_total as f64 * dsp::FRAME as f64 / f64::from(dsp::SAMPLE_RATE),
             stats.skipped.load(Ordering::Relaxed),
             status.invalid_samples,
@@ -532,56 +475,34 @@ fn describe(device: Option<ObjectId>) -> String {
     device.map_or("missing".into(), |id| id.to_string())
 }
 
-/// Why the engine runs, for the log.
-fn describe_use(mic: bool) -> &'static str {
-    if mic {
-        "the mic is in use"
-    } else {
-        "an app plays"
-    }
-}
-
 /// The echo canceller's part of the status line: what it did between `earlier` and `now`.
-/// `far_end` is whether the chain gets what the Mac plays.
-fn describe_echo(far_end: bool, now: &Seen, earlier: &Seen) -> String {
-    if !far_end {
-        return "echo canceller off (no far end)".to_owned();
+/// `off` is why the chain gets no far end, when it gets none.
+fn describe_echo(off: Option<&str>, now: &Seen, earlier: &Seen) -> String {
+    if let Some(why) = off {
+        return format!("echo canceller off ({why})");
     }
     let echo = &now.echo;
     let active = echo
         .active_frames
         .saturating_sub(earlier.echo.active_frames);
-    if active == 0 {
-        return "echo canceller idle".to_owned();
-    }
-    let frames = now.frames.saturating_sub(earlier.frames).max(1);
-    let share = (100.0 * (active * dsp::FRAME as u64) as f64 / frames as f64).min(100.0);
-    let removed = match echo.removed_db_since(&earlier.echo) {
-        Some(db) => format!("removed {db:.1} dB in far-end-only frames"),
-        None => "no far-end-only frames".to_owned(),
-    };
-    format!(
-        "echo canceller active {share:.0}% of the time, {removed}, ERLE {:.1} dB, \
-         echo path at {:.0} ms after the reference",
-        echo.erle_db, echo.echo_delay_ms
-    )
-}
-
-/// The playback part of the status line. `forwards` is whether the engine sends what the Mac
-/// plays on to the Komplete, `playing` whether an app plays right now, and `missing` the
-/// callbacks since the last line that had no buffer to forward from or to.
-fn describe_playback(forwards: bool, playing: bool, missing: u64) -> String {
-    if !forwards {
-        return "playback not forwarded (Francisco's Speakers is not installed)".to_owned();
-    }
-    let mut line = "playback forwarded to the Komplete".to_owned();
-    line += if playing {
-        " (an app plays)"
+    let mut line = if active == 0 {
+        "echo canceller idle".to_owned()
     } else {
-        " (no app plays)"
+        let frames = now.frames.saturating_sub(earlier.frames).max(1);
+        let share = (100.0 * (active * dsp::FRAME as u64) as f64 / frames as f64).min(100.0);
+        let removed = match echo.removed_db_since(&earlier.echo) {
+            Some(db) => format!("removed {db:.1} dB in far-end-only frames"),
+            None => "no far-end-only frames".to_owned(),
+        };
+        format!(
+            "echo canceller active {share:.0}% of the time, {removed}, ERLE {:.1} dB, \
+             echo path at {:.0} ms after the reference",
+            echo.erle_db, echo.echo_delay_ms
+        )
     };
+    let missing = now.missing.saturating_sub(earlier.missing);
     if missing > 0 {
-        line += &format!(", no buffer for it in {missing} callbacks");
+        line += &format!(", no loopback buffer in {missing} callbacks");
     }
     line
 }
@@ -686,7 +607,7 @@ mod tests {
                 far_in: far.1,
                 far_out: far.2,
                 erle_db: 18.26,
-                echo_delay_ms: 20.0,
+                echo_delay_ms: 8.0,
             },
             missing: 0,
         }
@@ -696,50 +617,46 @@ mod tests {
     fn the_status_line_says_what_the_echo_canceller_did_since_the_last_one() {
         let start = Seen::default();
         let quiet = seen(2_880_000, 0, (0, 0.0, 0.0));
-        assert_eq!(describe_echo(true, &quiet, &start), "echo canceller idle");
+        assert_eq!(describe_echo(None, &quiet, &start), "echo canceller idle");
         assert_eq!(
-            describe_echo(false, &quiet, &start),
-            "echo canceller off (no far end)"
+            describe_echo(
+                Some("Francisco's Speakers is not installed"),
+                &quiet,
+                &start
+            ),
+            "echo canceller off (Francisco's Speakers is not installed)"
         );
 
         // A minute later: 15 s of far end, with 20 dB less energy out than in while only the
         // far end spoke.
         let call = seen(5_760_000, 1_500, (900, 50.0, 0.5));
         assert_eq!(
-            describe_echo(true, &call, &quiet),
+            describe_echo(None, &call, &quiet),
             "echo canceller active 25% of the time, removed 20.0 dB in far-end-only frames, \
-             ERLE 18.3 dB, echo path at 20 ms after the reference"
+             ERLE 18.3 dB, echo path at 8 ms after the reference"
         );
 
         // Active with the owner talking over the far end throughout, then nothing new.
         let double = seen(8_640_000, 2_100, (900, 50.0, 0.5));
         assert_eq!(
-            describe_echo(true, &double, &call),
+            describe_echo(None, &double, &call),
             "echo canceller active 10% of the time, no far-end-only frames, ERLE 18.3 dB, \
-             echo path at 20 ms after the reference"
+             echo path at 8 ms after the reference"
         );
-        let after = seen(11_520_000, 2_100, (900, 50.0, 0.5));
-        assert_eq!(describe_echo(true, &after, &double), "echo canceller idle");
+        let mut after = seen(11_520_000, 2_100, (900, 50.0, 0.5));
+        assert_eq!(describe_echo(None, &after, &double), "echo canceller idle");
+
+        // Callbacks that came without a buffer for the loopback, since the last line.
+        after.missing = 7;
+        assert_eq!(
+            describe_echo(None, &after, &double),
+            "echo canceller idle, no loopback buffer in 7 callbacks"
+        );
+        assert_eq!(describe_echo(None, &after, &after), "echo canceller idle");
     }
 
     #[test]
-    fn the_status_line_says_whether_playback_is_forwarded() {
-        assert_eq!(
-            describe_playback(true, true, 0),
-            "playback forwarded to the Komplete (an app plays)"
-        );
-        assert_eq!(
-            describe_playback(true, false, 7),
-            "playback forwarded to the Komplete (no app plays), no buffer for it in 7 callbacks"
-        );
-        assert_eq!(
-            describe_playback(false, false, 0),
-            "playback not forwarded (Francisco's Speakers is not installed)"
-        );
-    }
-
-    #[test]
-    fn the_engine_runs_without_the_speakers_and_forwards_only_with_both_their_devices() {
+    fn the_engine_runs_without_the_loopback() {
         let devices = Devices {
             mic: Some(1),
             feed: Some(2),
@@ -747,29 +664,30 @@ mod tests {
             speakers: None,
             loopback: None,
         };
-        assert_eq!(devices.route(), None);
         assert_eq!(devices.path().unwrap().loopback, None);
 
-        let routed = Devices {
+        let installed = Devices {
             speakers: Some(4),
             loopback: Some(5),
             ..devices
         };
-        assert_eq!(routed.route(), Some((4, 5)));
-        assert_eq!(routed.path().unwrap().loopback, Some(5));
-
-        // One of the two alone is not a route.
-        let half = Devices {
-            loopback: None,
-            ..routed
-        };
-        assert_eq!(half.route(), None);
-        assert_eq!(half.path().unwrap().loopback, None);
-        // Nor is there an engine without the mic's devices or the Komplete.
-        let bare = Devices {
-            komplete: None,
-            ..routed
-        };
-        assert!(bare.path().is_none());
+        assert_eq!(installed.path().unwrap().loopback, Some(5));
+        // There is no engine without the mic's devices or the Komplete.
+        for missing in [
+            Devices {
+                komplete: None,
+                ..installed
+            },
+            Devices {
+                feed: None,
+                ..installed
+            },
+            Devices {
+                mic: None,
+                ..installed
+            },
+        ] {
+            assert!(missing.path().is_none());
+        }
     }
 }

@@ -1,13 +1,13 @@
 //! The running audio path: a private aggregate of the Komplete, the feed and the loopback of
 //! Francisco's Speakers, with one IOProc on it. The IOProc runs the mic through the chain into
-//! the feed, and sends what the Mac plays on to the Komplete's output, which is also the echo
-//! canceller's far end. An `Engine` exists only while an app reads the mic or something plays;
-//! dropping it stops IO and destroys the IOProc and the aggregate before the IOProc's context is
-//! freed.
+//! the feed, with the loopback, which carries what the Mac plays, as the echo canceller's far
+//! end. It never writes the Komplete's output: the Mac's sound gets there through the owner's
+//! Multi-Output Device, without micd. An `Engine` exists only while an app reads the mic;
+//! stopping it stops IO and destroys the IOProc and the aggregate before the chain goes back to
+//! the daemon.
 
 use std::ffi::CStr;
 use std::fmt;
-use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -32,7 +32,7 @@ use dsp::Chain;
 
 use crate::capture::Capture;
 use crate::hal::{self, ObjectId, GLOBAL, INPUT, OUTPUT};
-use crate::io::{self, Buffers, Context, Route, Stats};
+use crate::io::{self, Buffers, Context, Stats};
 use crate::wake;
 
 const SAMPLE_RATE: f64 = dsp::SAMPLE_RATE as f64;
@@ -43,6 +43,14 @@ const SAMPLE_RATE: f64 = dsp::SAMPLE_RATE as f64;
 /// because with a whole buffer of slack the core runs the IOProc at its lowest clock speed
 /// (about 165 µs per callback against about 60 µs). The IOProc still has over 5 ms to finish.
 const IO_CYCLE_USAGE: f32 = 0.5;
+
+/// Why the chain gets no far end when the loopback's driver is missing.
+const NOT_INSTALLED: &str = "Francisco's Speakers is not installed";
+/// And when the aggregate with the loopback did not confirm the order of its streams.
+const ORDER_UNCONFIRMED: &str = "the order of the aggregate's streams is unconfirmed";
+
+/// Only `release` takes the context out of an engine, and nothing uses the engine after it.
+const RELEASED: &str = "the engine was released";
 
 /// Why the engine could not start. The control thread logs it and retries.
 #[derive(Debug)]
@@ -60,6 +68,12 @@ impl From<hal::Error> for Error {
     }
 }
 
+/// A start that failed: why, and the chain it was given, unless an IOProc may still run on it.
+pub struct Failed {
+    pub error: Error,
+    pub chain: Option<Box<Chain>>,
+}
+
 /// The devices an engine is built from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Path {
@@ -67,9 +81,9 @@ pub struct Path {
     pub feed: ObjectId,
     /// The visible mic. Only read for the latency report.
     pub mic: ObjectId,
-    /// The hidden input of Francisco's Speakers, which carries what the Mac plays. `None` when
-    /// that driver is not installed: then nothing is forwarded and the echo canceller has no
-    /// far end.
+    /// The hidden input of Francisco's Speakers, which carries what the Mac plays while the
+    /// Multi-Output Device is the output. `None` when that driver is not installed: then the
+    /// echo canceller has no far end.
     pub loopback: Option<ObjectId>,
 }
 
@@ -77,8 +91,9 @@ pub struct Engine {
     /// `kAudioObjectUnknown` while there is none.
     aggregate: ObjectId,
     path: Path,
-    /// How long after the reference its echo arrives, in frames. `None` without a loopback.
-    echo_delay: Option<u32>,
+    /// The earliest the echo follows the reference, in frames, or why the chain gets no
+    /// reference.
+    far_end: Result<u32, &'static str>,
     /// `None` until the IOProc is created.
     io_proc: AudioDeviceIOProcID,
     running: bool,
@@ -87,42 +102,110 @@ pub struct Engine {
     /// Set once an IOProc could not be shown to have stopped. Its context is then never reused
     /// or freed.
     stuck: bool,
-    /// Freed in `drop`, once the IOProc can no longer run.
-    context: ManuallyDrop<Box<Context>>,
+    /// The IOProc's client data, which holds the chain. `None` once `release` took it.
+    context: Option<Box<Context>>,
 }
 
 impl Engine {
-    /// Builds the aggregate and starts IO through `chain`. The engine drops the chain, on the
-    /// control thread, once the IOProc is gone. `mic_in_use` says whether the chain runs from
-    /// the first callback or the engine starts out forwarding playback only.
+    /// Builds the aggregate and starts IO through `chain`. The chain comes back from `stop`,
+    /// and from a start that failed.
     pub fn start(
         path: Path,
-        chain: Chain,
-        mic_in_use: bool,
+        chain: Box<Chain>,
         capture: Option<Box<Capture>>,
-    ) -> Result<Engine, Error> {
-        let plan = Plan::read(path)?;
-        let context = Context::new(chain, Buffers::default(), capture);
-        context.set_mic_in_use(mic_in_use);
+    ) -> Result<Engine, Failed> {
+        let plan = match Plan::read(path) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let chain = Some(chain);
+                return Err(Failed { error, chain });
+            }
+        };
         let mut engine = Engine {
             aggregate: kAudioObjectUnknown,
             path,
-            echo_delay: None,
+            far_end: Err(NOT_INSTALLED),
             io_proc: None,
             running: false,
             listening: false,
             buffer_frames: 0,
             stuck: false,
-            context: ManuallyDrop::new(context),
+            context: Some(Context::new(chain, Buffers::default(), capture)),
         };
-        // After an error, dropping the engine undoes whatever was set up.
-        engine.build(&plan)?;
-        Ok(engine)
+        match engine.build(plan) {
+            Ok(()) => Ok(engine),
+            // Stopping the engine undoes whatever was set up.
+            Err(error) => Err(Failed {
+                error,
+                chain: engine.stop(),
+            }),
+        }
     }
 
-    /// Creates the aggregate and starts IO on it.
-    fn build(&mut self, plan: &Plan) -> Result<(), Error> {
-        let description = describe_aggregate(&plan.komplete_uid, &plan.resampled());
+    /// Stops IO, destroys the IOProc and the aggregate, and gives the chain back for the next
+    /// engine. `None` when the IOProc could not be shown to be gone: it may still run on the
+    /// chain, so the chain stays with it and leaks.
+    pub fn stop(mut self) -> Option<Box<Chain>> {
+        self.release()
+    }
+
+    /// Tears everything down and takes the chain out of the context, once.
+    fn release(&mut self) -> Option<Box<Chain>> {
+        let free = self.dismantle();
+        let context = self.context.take()?;
+        if !free {
+            // An IOProc may still be called with it, so it is never freed.
+            std::mem::forget(context);
+            return None;
+        }
+        if let Some(capture) = &context.capture {
+            match capture.write() {
+                Ok(Some(path)) => log!("capture written to {}", path.display()),
+                Ok(None) => {}
+                Err(error) => log!("could not write the capture: {error}"),
+            }
+        }
+        Some(context.into_chain())
+    }
+
+    fn context(&self) -> &Context {
+        self.context.as_deref().expect(RELEASED)
+    }
+
+    /// Creates the aggregate and starts IO on it. An aggregate with the loopback has to
+    /// confirm the order of its streams, or one without the loopback replaces it.
+    fn build(&mut self, mut plan: Plan) -> Result<(), Error> {
+        let parts = loop {
+            let parts = self.create(&plan)?;
+            let order = read_order(self.aggregate, &plan.members());
+            match order.verdict(plan.loopback_uid.is_some()) {
+                Verdict::Run => {
+                    if order != Order::Confirmed {
+                        log!("{order}; the stream counts match, so the engine runs");
+                    }
+                    break parts;
+                }
+                Verdict::RunWithoutLoopback => {
+                    log!(
+                        "{order}; starting without the loopback, so the echo canceller has no \
+                         far end"
+                    );
+                    // No IOProc exists yet, so this only destroys the aggregate.
+                    self.dismantle();
+                    plan = plan.without_loopback();
+                    self.far_end = Err(ORDER_UNCONFIRMED);
+                }
+                Verdict::Fail => return Err(Error(order.to_string())),
+            }
+        };
+        self.configure(&plan, parts)
+    }
+
+    /// Creates the aggregate for `plan` and waits until it has picked up its sub-devices and
+    /// their streams.
+    fn create(&mut self, plan: &Plan) -> Result<Parts, Error> {
+        let resampled = plan.resampled();
+        let description = describe_aggregate(&plan.komplete_uid, &resampled);
         let mut aggregate = kAudioObjectUnknown;
         let status = unsafe {
             AudioHardwareCreateAggregateDevice(
@@ -132,19 +215,26 @@ impl Engine {
         };
         hal::check(status, "create aggregate")?;
         self.aggregate = aggregate;
-        self.configure(plan)
+        let (inputs, outputs) = wait_for_streams(aggregate, &plan.layout)?;
+        Ok(Parts {
+            inputs,
+            outputs,
+            resampled: wait_for_subdevices(aggregate, &resampled)?,
+        })
     }
 
-    fn configure(&mut self, plan: &Plan) -> Result<(), Error> {
+    fn configure(&mut self, plan: &Plan, parts: Parts) -> Result<(), Error> {
         let aggregate = self.aggregate;
         let layout = plan.layout;
-        let (inputs, outputs) = wait_for_streams(aggregate, &layout)?;
-        let resampled = plan.resampled();
-        let subdevices = wait_for_subdevices(aggregate, &resampled)?;
+        let Parts {
+            inputs,
+            outputs,
+            resampled,
+        } = parts;
         // Running without drift compensation beats not running, so this only gets logged.
         let drift: Vec<String> = ["feed", "loopback"]
             .iter()
-            .zip(subdevices)
+            .zip(resampled)
             .map(|(name, subdevice)| match compensate_drift(subdevice) {
                 Ok(true) => format!("{name} on"),
                 Ok(false) => format!("{name} OFF"),
@@ -154,29 +244,19 @@ impl Engine {
                 }
             })
             .collect();
-        check_order(aggregate, &plan.komplete_uid, &resampled)?;
 
         let input_channels = float_channels(inputs[0], "the Komplete input stream")?;
         let feed_channels = float_channels(outputs[layout.feed_output()], "the feed stream")?;
-        let mut route = None;
-        let mut forwarded = [String::new(), String::new()];
-        if let (Some(loopback), Some(output)) = (layout.loopback_input(), layout.playback_output())
-        {
-            let from = float_channels(inputs[loopback], "the loopback stream")?;
-            let to = float_channels(outputs[output], "the Komplete output stream")?;
-            route = Some(Route { loopback, output });
-            forwarded = [
-                format!(" and {} ({from} ch, the loopback)", loopback + 1),
-                format!(
-                    " and {} ({to} ch, the Komplete, for what plays)",
-                    output + 1
-                ),
-            ];
+        let mut loopback = String::new();
+        if let Some(stream) = layout.loopback_input() {
+            let channels = float_channels(inputs[stream], "the loopback stream")?;
+            loopback = format!(" and {} ({channels} ch, the loopback)", stream + 1);
         }
-        self.context.set_buffers(Buffers {
+        let context = self.context.as_deref_mut().expect(RELEASED);
+        context.set_buffers(Buffers {
             input: 0,
+            loopback: layout.loopback_input(),
             feed: layout.feed_output(),
-            route,
         });
 
         let mut io_proc: AudioDeviceIOProcID = None;
@@ -184,16 +264,17 @@ impl Engine {
             AudioDeviceCreateIOProcID(
                 aggregate,
                 Some(io::io_proc),
-                self.context.client_data(),
+                context.client_data(),
                 NonNull::from(&mut io_proc),
             )
         };
         hal::check(status, "create IOProc")?;
         self.io_proc = io_proc;
 
-        // Only the Komplete's first stream and the loopback's are on for input. For output, the
-        // feed's stream is on, and the Komplete's only with a loopback to fill it from: the
-        // IOProc writes nothing else there.
+        // Only the Komplete's first stream and the loopback's are on for input, and only the
+        // feed's for output. The Komplete's output streams stay off: what the Mac plays gets
+        // there without micd, and the IOProc writes nothing to them even when the HAL hands it
+        // their buffers.
         let input_usage = layout.input_usage();
         let output_usage = layout.output_usage();
         hal::set_stream_usage(aggregate, io_proc, INPUT, &input_usage)?;
@@ -210,18 +291,17 @@ impl Engine {
             log!("{error}");
         }
         let cycle_usage = hal::get::<f32>(aggregate, usage, GLOBAL).unwrap_or(1.0);
-        let [loopback, playback] = forwarded;
         log!(
             "aggregate {aggregate}: {} frames per buffer; input stream 1 ({input_channels} ch, \
-             the Komplete){loopback} of {} on; output stream {} ({feed_channels} ch, the \
-             feed){playback} of {} on; drift compensation: {}",
+             the Komplete){loopback} of {} on; output stream {} ({feed_channels} ch, the feed) \
+             of {} on; drift compensation: {}",
             self.buffer_frames,
             inputs.len(),
             layout.feed_output() + 1,
             outputs.len(),
             drift.join(", "),
         );
-        self.report_latency(plan.path, cycle_usage);
+        self.report_latency(plan, cycle_usage);
         report_members(self.aggregate);
 
         hal::add_listener(aggregate, kAudioDevicePropertyDeviceIsAlive, wake::ALIVE)?;
@@ -232,9 +312,10 @@ impl Engine {
     }
 
     /// Logs the latency from the Komplete's input to the visible mic's input, in frames at
-    /// 48 kHz, from what the devices report. With a loopback it also logs how much later
-    /// playback reaches the Komplete, and works out the echo delay.
-    fn report_latency(&mut self, path: Path, cycle_usage: f32) {
+    /// 48 kHz, from what the devices report. With the loopback it also works out the echo
+    /// delay.
+    fn report_latency(&mut self, plan: &Plan, cycle_usage: f32) {
+        let path = plan.path;
         let first = |device, scope| hal::streams(device, scope).ok()?.first().copied();
         let komplete = Leg::read(path.komplete, first(path.komplete, INPUT), INPUT);
         let feed = Leg::read(path.feed, first(path.feed, OUTPUT), OUTPUT);
@@ -264,18 +345,14 @@ impl Engine {
             + feed.stream
             + mic.total();
         let ms = |frames: u32| f64::from(frames) / SAMPLE_RATE * 1e3;
-        let mut playback = String::new();
-        if path.loopback.is_some() {
+        let mut echo = String::new();
+        if plan.loopback_uid.is_some() {
             let output = Leg::read(path.komplete, first(path.komplete, OUTPUT), OUTPUT);
-            let delay = cycle.echo_delay(&output, &komplete);
-            self.echo_delay = Some(delay);
-            playback = format!(
-                "; playback reaches the Komplete's output {} = {:.1} ms later (input safety + \
-                 buffer + output lead + output safety); its echo is in the mic's stream after \
-                 that + Komplete output {}+{} + input {}+{} (device+stream): echo delay {delay} \
-                 = {:.1} ms",
-                cycle.through(),
-                ms(cycle.through()),
+            let delay = echo_delay(&output, &komplete);
+            self.far_end = Ok(delay);
+            echo = format!(
+                "; the echo follows the loopback's copy of what plays by at least Komplete \
+                 output {}+{} + input {}+{} (device+stream): echo delay {delay} = {:.1} ms",
                 output.device,
                 output.stream,
                 komplete.device,
@@ -287,7 +364,7 @@ impl Engine {
             "latency in frames: Komplete {}+{} (device+stream), input safety {input_safety}, \
              buffer {buffer}, output lead {lead} (cycle usage {cycle_usage}), output safety \
              {output_safety}, chain {chain}, feed {}+{}, mic {mic} \
-             (device+stream+safety): {total} = {:.1} ms, before the reader's own buffer{playback}",
+             (device+stream+safety): {total} = {:.1} ms, before the reader's own buffer{echo}",
             komplete.device,
             komplete.stream,
             feed.device,
@@ -297,26 +374,16 @@ impl Engine {
     }
 
     pub fn stats(&self) -> &Stats {
-        &self.context.stats
+        &self.context().stats
     }
 
     pub fn path(&self) -> Path {
         self.path
     }
 
-    /// Whether the engine sends what the Mac plays on to the Komplete.
-    pub fn forwards_playback(&self) -> bool {
-        self.path.loopback.is_some()
-    }
-
-    /// The echo delay to give the chain, in samples, when the chain gets a far end.
-    pub fn echo_delay(&self) -> Option<usize> {
-        self.echo_delay.map(|delay| delay as usize)
-    }
-
-    /// Whether an app reads the mic. While none does, the IOProc only forwards playback.
-    pub fn set_mic_in_use(&self, in_use: bool) {
-        self.context.set_mic_in_use(in_use);
+    /// The echo delay to give the chain, in samples, or why the chain gets no far end.
+    pub fn far_end(&self) -> Result<usize, &'static str> {
+        self.far_end.map(|delay| delay as usize)
     }
 
     /// False once the aggregate or the Komplete is gone.
@@ -343,7 +410,8 @@ impl Engine {
     }
 
     /// Waits until the IOProc has provably stopped running. `AudioDeviceStop` is expected to
-    /// guarantee that already, but nothing documents it and the context is about to be freed.
+    /// guarantee that already, but nothing documents it and the chain is about to go to
+    /// another IOProc.
     fn wait_for_quiet(&self) -> bool {
         let stats = self.stats();
         // Longer than two IO cycles, so a callback that is still being scheduled shows up.
@@ -361,8 +429,8 @@ impl Engine {
     }
 
     /// Stops IO and destroys the IOProc and the aggregate, if there are any. Returns whether
-    /// the context is free: no IOProc can run on it any more, so it can go to another IOProc or
-    /// be dropped.
+    /// the context is free: no IOProc can run on it any more, so its chain can go to another
+    /// IOProc.
     fn dismantle(&mut self) -> bool {
         if self.aggregate == kAudioObjectUnknown {
             return !self.stuck;
@@ -390,8 +458,8 @@ impl Engine {
             }
         }
         // Only a confirmed destroy followed by a quiet spell frees the context. A quiet spell
-        // alone may be a stall, so without the destroy the context leaks (about 470 KB, most of
-        // it the echo canceller, once per coreaudiod restart).
+        // alone may be a stall, so without the destroy the context leaks with its chain (about
+        // 470 KB, most of it the echo canceller, once per coreaudiod restart).
         let quiet = self.io_proc.is_none() || (removed && self.wait_for_quiet());
         if ours {
             let status = unsafe { AudioHardwareDestroyAggregateDevice(self.aggregate) };
@@ -405,7 +473,7 @@ impl Engine {
             } else {
                 "the IOProc was not destroyed"
             };
-            log!("{why}; leaking its context");
+            log!("{why}; leaking its context and its chain");
             self.stuck = true;
         }
         self.aggregate = kAudioObjectUnknown;
@@ -418,18 +486,18 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        if self.dismantle() {
-            if let Some(capture) = &self.context.capture {
-                match capture.write() {
-                    Ok(Some(path)) => log!("capture written to {}", path.display()),
-                    Ok(None) => {}
-                    Err(error) => log!("could not write the capture: {error}"),
-                }
-            }
-            // The IOProc is stopped and destroyed, so nothing else refers to the context.
-            unsafe { ManuallyDrop::drop(&mut self.context) };
-        }
+        // After `stop` there is nothing left to do. An engine dropped without it frees its
+        // chain here.
+        self.release();
     }
+}
+
+/// A new aggregate's streams, and the sub-device objects of its resampled members in the
+/// plan's order.
+struct Parts {
+    inputs: Vec<ObjectId>,
+    outputs: Vec<ObjectId>,
+    resampled: Vec<ObjectId>,
 }
 
 /// What an engine is built from, read before anything is created.
@@ -488,12 +556,26 @@ impl Plan {
         uids.extend(self.loopback_uid.as_deref());
         uids
     }
+
+    /// Every member, in the order the aggregate gets them.
+    fn members(&self) -> Vec<&str> {
+        let mut uids = vec![self.komplete_uid.as_str()];
+        uids.extend(self.resampled());
+        uids
+    }
+
+    /// The same plan for an aggregate of the Komplete and the feed alone.
+    fn without_loopback(mut self) -> Plan {
+        self.loopback_uid = None;
+        self.layout.loopback = None;
+        self
+    }
 }
 
 /// The streams of the aggregate. It lists its sub-devices' streams in the order of the
 /// sub-devices: the Komplete's, the feed's, then the loopback's. So the Komplete's first input
 /// stream is the aggregate's first, and the others are found by counting the streams before
-/// them. `check_order` confirms the order on the aggregate.
+/// them. `read_order` confirms the order on the aggregate.
 #[derive(Clone, Copy)]
 struct Layout {
     komplete_inputs: usize,
@@ -513,8 +595,6 @@ impl Layout {
             Some("the feed has no output stream")
         } else if self.loopback.is_some_and(|(inputs, _)| inputs == 0) {
             Some("the loopback has no input stream")
-        } else if self.loopback.is_some() && self.komplete_outputs == 0 {
-            Some("the Komplete has no output stream to play on")
         } else {
             None
         }
@@ -539,12 +619,6 @@ impl Layout {
         self.komplete_outputs
     }
 
-    /// The Komplete's first output stream, among the aggregate's output streams, when there is
-    /// a loopback to fill it from.
-    fn playback_output(&self) -> Option<usize> {
-        self.loopback.map(|_| 0)
-    }
-
     /// Which input streams the IOProc reads.
     fn input_usage(&self) -> Vec<bool> {
         (0..self.inputs())
@@ -552,10 +626,11 @@ impl Layout {
             .collect()
     }
 
-    /// Which output streams the IOProc writes.
+    /// Which output streams the IOProc writes: the feed's first and no other. The Komplete's
+    /// stay off with or without the loopback.
     fn output_usage(&self) -> Vec<bool> {
         (0..self.outputs())
-            .map(|stream| stream == self.feed_output() || Some(stream) == self.playback_output())
+            .map(|stream| stream == self.feed_output())
             .collect()
     }
 }
@@ -605,31 +680,29 @@ struct Cycle {
 
 impl Cycle {
     /// From a sample's place in the input stream to the place in the output stream of the
-    /// sample the IOProc writes for it in the same callback.
-    ///
-    /// The mic takes this long through the IOProc before the chain's own latency. Playback
-    /// takes it too, so it reaches the Komplete's output this much later than Francisco's
-    /// Speakers was given it.
+    /// sample the IOProc writes for it in the same callback. The mic takes this long through
+    /// the IOProc before the chain's own latency.
     fn through(&self) -> u32 {
         self.input_safety + self.buffer + self.lead + self.output_safety
     }
+}
 
-    /// How long after a sample of the reference its echo shows up in the mic's samples, in
-    /// frames. `output` and `input` are the Komplete's two directions.
-    ///
-    /// The chain gets a callback's loopback as the reference for that callback's mic buffer,
-    /// sample for sample, and the IOProc writes the same loopback to the Komplete's output. The
-    /// mic's sample sat in the input stream at `now - input_safety - buffer`. The played sample
-    /// goes into the output stream at `now + lead + output_safety`, which is `through()` later.
-    /// From there it takes the output's device and stream latency to reach the headphones or
-    /// speakers, next to no time through the air to the mic (3 ms per metre from a speaker),
-    /// and the input's device and stream latency to show up in the input stream.
-    ///
-    /// So the reference always comes before its echo, which the canceller needs: it looks for
-    /// the echo from this delay onwards.
-    fn echo_delay(&self, output: &Leg, input: &Leg) -> u32 {
-        self.through() + output.device + output.stream + input.device + input.stream
-    }
+/// The earliest a sample's echo shows up in the mic's samples after the sample itself shows up
+/// in the reference, in frames. `output` and `input` are the Komplete's two directions.
+///
+/// The reference is the loopback of Francisco's Speakers, read in the same callback as the mic.
+/// The owner's Multi-Output Device gives what plays to the Komplete and to Francisco's Speakers
+/// together. From there the Komplete's copy takes the output's device and stream latency to
+/// reach the headphones or speakers, next to no time through the air to the mic (3 ms per
+/// metre from a speaker), and the input's device and stream latency to show up in the input
+/// stream. The Multi-Output Device and the drift corrections add to that, and no device
+/// reports by how much: live the echo trailed the reference by 430 frames where this gives 88.
+///
+/// The canceller looks for the echo from this delay onwards. Its 160 ms filter covers an echo
+/// that comes later, and nothing covers one that comes earlier, so this is the part that is
+/// certain.
+fn echo_delay(output: &Leg, input: &Leg) -> u32 {
+    output.device + output.stream + input.device + input.stream
 }
 
 /// The process ID keeps a second instance, or a stale one, from colliding on the UID.
@@ -736,26 +809,84 @@ fn wait_for_subdevices(aggregate: ObjectId, uids: &[&str]) -> Result<Vec<ObjectI
     })
 }
 
-/// Checks that the aggregate lists its sub-devices in the order it was given them. That order
-/// is the order of its streams, which is how `Layout` tells the loopback's stream from the
-/// Komplete's. In another order the IOProc could read what plays as the mic.
-fn check_order(aggregate: ObjectId, clock_uid: &str, resampled_uids: &[&str]) -> Result<(), Error> {
-    let mut expected = vec![clock_uid];
-    expected.extend(resampled_uids);
-    poll(|| {
-        let selector = kAudioAggregateDevicePropertyFullSubDeviceList;
-        Ok(match hal::get_strings(aggregate, selector, GLOBAL) {
-            Ok(found) if found == expected => Ok(()),
-            Ok(found) => Err(format!(
+/// What the aggregate's own list of its sub-devices says about their order. That order is the
+/// order of its streams, which is how `Layout` tells the loopback's stream from the Komplete's
+/// and the feed's from the Komplete's output.
+#[derive(Debug, PartialEq)]
+enum Order {
+    /// It lists them in the order it was given them.
+    Confirmed,
+    /// It lists them in another order: which.
+    Differs(String),
+    /// The list could not be read: why.
+    Unknown(String),
+}
+
+/// What an engine does about the order of its aggregate's streams.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Run,
+    /// Destroy the aggregate and build one of the Komplete and the feed alone.
+    RunWithoutLoopback,
+    Fail,
+}
+
+impl Order {
+    /// `found` is the aggregate's list, or why it could not be read.
+    fn of(found: Result<Vec<String>, String>, expected: &[&str]) -> Order {
+        match found {
+            Ok(found) if found == expected => Order::Confirmed,
+            Ok(found) => Order::Differs(format!(
                 "the aggregate lists its sub-devices as {found:?}, not as {expected:?}"
             )),
-            // The stream counts matched the layout, so the engine still runs.
-            Err(error) => {
-                log!("{error}; the order of the aggregate's sub-devices is unchecked");
-                Ok(())
+            Err(why) => Order::Unknown(why),
+        }
+    }
+
+    /// `loopback` is whether the aggregate carries the loopback. The Komplete's input and the
+    /// loopback are both 2-channel Float32 streams, so nothing in the IOProc could tell that it
+    /// reads what plays as the mic, and calls would get the Mac's sound. With the loopback
+    /// only a confirmed order will do. Without it the Komplete's are the only input streams;
+    /// an order that is known to differ still puts the feed's stream somewhere else.
+    fn verdict(&self, loopback: bool) -> Verdict {
+        match (self, loopback) {
+            (Order::Confirmed, _) => Verdict::Run,
+            (_, true) => Verdict::RunWithoutLoopback,
+            (Order::Differs(_), false) => Verdict::Fail,
+            (Order::Unknown(_), false) => Verdict::Run,
+        }
+    }
+}
+
+impl fmt::Display for Order {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Order::Confirmed => f.write_str("the aggregate lists its sub-devices in order"),
+            Order::Differs(which) => f.write_str(which),
+            Order::Unknown(why) => {
+                write!(
+                    f,
+                    "{why}: the order of the aggregate's sub-devices is unknown"
+                )
             }
-        })
-    })
+        }
+    }
+}
+
+/// Reads the order of the aggregate's sub-devices, which `expected` names in the order it was
+/// given them. A new aggregate may take a moment to list them all, so another order is only
+/// final after a while.
+fn read_order(aggregate: ObjectId, expected: &[&str]) -> Order {
+    let selector = kAudioAggregateDevicePropertyFullSubDeviceList;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let found = hal::get_strings(aggregate, selector, GLOBAL);
+        let order = Order::of(found.map_err(|error| error.to_string()), expected);
+        if !matches!(order, Order::Differs(_)) || Instant::now() >= deadline {
+            return order;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Makes sure a sub-device is resampled to the Komplete's clock, and returns whether it is.
@@ -826,28 +957,27 @@ mod tests {
     }
 
     #[test]
-    fn the_loopback_is_one_more_input_stream_and_turns_the_komplete_output_on() {
-        // Without Francisco's Speakers: the aggregate micd ran on before it forwarded playback.
+    fn the_loopback_is_one_more_input_stream_and_the_komplete_output_stays_off() {
+        // Without Francisco's Speakers.
         let plain = layout(false);
         assert_eq!((plain.inputs(), plain.outputs()), (1, 2));
         assert_eq!(plain.loopback_input(), None);
-        assert_eq!(plain.playback_output(), None);
         assert_eq!(plain.feed_output(), 1);
         assert_eq!(plain.input_usage(), [true]);
         assert_eq!(plain.output_usage(), [false, true]);
         assert_eq!(plain.missing(), None);
 
-        let routed = layout(true);
-        assert_eq!((routed.inputs(), routed.outputs()), (2, 2));
-        assert_eq!(routed.loopback_input(), Some(1));
-        assert_eq!(routed.playback_output(), Some(0));
-        assert_eq!(routed.feed_output(), 1);
-        assert_eq!(routed.input_usage(), [true, true]);
-        assert_eq!(routed.output_usage(), [true, true]);
-        assert_eq!(routed.missing(), None);
+        // With it the IOProc reads one more stream and still writes only the feed's.
+        let with_loopback = layout(true);
+        assert_eq!((with_loopback.inputs(), with_loopback.outputs()), (2, 2));
+        assert_eq!(with_loopback.loopback_input(), Some(1));
+        assert_eq!(with_loopback.feed_output(), 1);
+        assert_eq!(with_loopback.input_usage(), [true, true]);
+        assert_eq!(with_loopback.output_usage(), [false, true]);
+        assert_eq!(with_loopback.missing(), None);
 
         // Devices with more streams: only the first input stream of the Komplete and of the
-        // loopback, and the first output stream of the Komplete and of the feed, are on.
+        // loopback, and the first output stream of the feed, are on.
         let wide = Layout {
             komplete_inputs: 2,
             komplete_outputs: 3,
@@ -861,15 +991,15 @@ mod tests {
         assert_eq!(wide.input_usage(), [true, false, false, true, false]);
         assert_eq!(
             wide.output_usage(),
-            [true, false, false, true, false, false]
+            [false, false, false, true, false, false]
         );
-        let unrouted = Layout {
+        let narrower = Layout {
             loopback: None,
             ..wide
         };
-        assert_eq!((unrouted.inputs(), unrouted.outputs()), (3, 5));
-        assert_eq!(unrouted.input_usage(), [true, false, false]);
-        assert_eq!(unrouted.output_usage(), [false, false, false, true, false]);
+        assert_eq!((narrower.inputs(), narrower.outputs()), (3, 5));
+        assert_eq!(narrower.input_usage(), [true, false, false]);
+        assert_eq!(narrower.output_usage(), [false, false, false, true, false]);
     }
 
     #[test]
@@ -891,27 +1021,33 @@ mod tests {
             no(|layout| layout.loopback = Some((0, 1))),
             Some("the loopback has no input stream")
         );
-        assert_eq!(
-            no(|layout| layout.komplete_outputs = 0),
-            Some("the Komplete has no output stream to play on")
-        );
-        // Without a loopback nothing plays on the Komplete, so it needs no output stream.
-        let mut silent = layout(false);
-        silent.komplete_outputs = 0;
-        assert_eq!(silent.missing(), None);
-        assert_eq!(silent.feed_output(), 0);
-        assert_eq!(silent.output_usage(), [true]);
+        // Nothing is written to the Komplete, so it needs no output stream.
+        let mut input_only = layout(true);
+        input_only.komplete_outputs = 0;
+        assert_eq!(input_only.missing(), None);
+        assert_eq!(input_only.feed_output(), 0);
+        assert_eq!(input_only.output_usage(), [true]);
     }
 
     #[test]
-    fn the_echo_trails_its_reference_by_the_way_through_the_io_proc_and_the_komplete() {
+    fn the_echo_delay_is_the_komplete_latency_out_and_in() {
         let leg = |device, stream, safety| Leg {
             device,
             stream,
             safety,
         };
-        // What the devices report today: the Komplete 14 frames out and 74 in, and the
-        // aggregate the same safety offsets.
+        // What the Komplete reports today: 14 frames out and 74 in. Live the echo trailed the
+        // reference by 430 frames, so this is on the early side, where it has to be.
+        assert_eq!(echo_delay(&leg(14, 0, 14), &leg(74, 0, 74)), 88);
+        // Device and stream latency count in both directions. The safety offsets don't: they
+        // say when the HAL reads and writes, not how long the converters take.
+        assert_eq!(
+            echo_delay(&leg(30, 4, 999), &leg(40, 2, 999)),
+            30 + 4 + 40 + 2
+        );
+        assert_eq!(echo_delay(&leg(0, 0, 0), &leg(0, 0, 0)), 0);
+
+        // The mic's own way through the IOProc is unchanged: 856 frames today.
         let cycle = Cycle {
             buffer: 512,
             lead: 256,
@@ -919,29 +1055,88 @@ mod tests {
             output_safety: 14,
         };
         assert_eq!(cycle.through(), 856);
-        assert_eq!(cycle.echo_delay(&leg(14, 0, 14), &leg(74, 0, 74)), 944);
+    }
 
-        // Every part counts once. The safety offsets are the aggregate's, not the Komplete's.
-        let cycle = Cycle {
-            buffer: 128,
-            lead: 64,
-            input_safety: 28,
-            output_safety: 20,
-        };
-        assert_eq!(cycle.through(), 28 + 128 + 64 + 20);
+    fn uids(list: &[&str]) -> Result<Vec<String>, String> {
+        Ok(list.iter().map(|uid| (*uid).to_owned()).collect())
+    }
+
+    #[test]
+    fn only_a_confirmed_order_lets_the_engine_read_the_loopback() {
+        let expected = ["komplete", "feed", "loopback"];
+        let confirmed = Order::of(uids(&expected), &expected);
+        assert_eq!(confirmed, Order::Confirmed);
+        assert_eq!(confirmed.verdict(true), Verdict::Run);
+
+        // The loopback's stream where the Komplete's is expected: playback would go out as the
+        // mic. And a list that is not complete.
+        for found in [
+            &["loopback", "feed", "komplete"][..],
+            &["komplete", "loopback", "feed"],
+            &["komplete", "feed"],
+            &[],
+        ] {
+            let order = Order::of(uids(found), &expected);
+            assert!(matches!(order, Order::Differs(_)), "{order:?}");
+            assert_eq!(order.verdict(true), Verdict::RunWithoutLoopback);
+        }
+        let swapped = Order::of(uids(&["loopback", "feed", "komplete"]), &expected);
         assert_eq!(
-            cycle.echo_delay(&leg(30, 4, 999), &leg(40, 2, 999)),
-            240 + 30 + 4 + 40 + 2
+            swapped.to_string(),
+            "the aggregate lists its sub-devices as [\"loopback\", \"feed\", \"komplete\"], \
+             not as [\"komplete\", \"feed\", \"loopback\"]"
         );
 
-        // Devices that report nothing still leave the reference a buffer and its lead ahead.
-        let bare = Cycle {
-            buffer: 512,
-            lead: 512,
-            input_safety: 0,
-            output_safety: 0,
+        // A list that can't be read confirms nothing.
+        let unknown = Order::of(Err("get 'grup' failed: 'who?'".to_owned()), &expected);
+        assert_eq!(unknown.verdict(true), Verdict::RunWithoutLoopback);
+        assert_eq!(
+            unknown.to_string(),
+            "get 'grup' failed: 'who?': the order of the aggregate's sub-devices is unknown"
+        );
+    }
+
+    #[test]
+    fn without_the_loopback_only_an_order_known_to_differ_stops_the_engine() {
+        let expected = ["komplete", "feed"];
+        assert_eq!(
+            Order::of(uids(&expected), &expected).verdict(false),
+            Verdict::Run
+        );
+        // The feed's stream would be where the Komplete's output is expected.
+        let swapped = Order::of(uids(&["feed", "komplete"]), &expected);
+        assert_eq!(swapped.verdict(false), Verdict::Fail);
+        // The Komplete's are the only input streams, so the mic is the mic either way.
+        let unknown = Order::of(Err("unreadable".to_owned()), &expected);
+        assert_eq!(unknown.verdict(false), Verdict::Run);
+    }
+
+    #[test]
+    fn a_plan_without_its_loopback_is_the_aggregate_of_the_komplete_and_the_feed() {
+        let path = Path {
+            komplete: 3,
+            feed: 2,
+            mic: 1,
+            loopback: Some(5),
         };
-        assert_eq!(bare.echo_delay(&leg(0, 0, 0), &leg(0, 0, 0)), 1024);
+        let plan = Plan {
+            path,
+            komplete_uid: "komplete".into(),
+            feed_uid: "feed".into(),
+            loopback_uid: Some("loopback".into()),
+            layout: layout(true),
+        };
+        assert_eq!(plan.members(), ["komplete", "feed", "loopback"]);
+        assert_eq!(plan.resampled(), ["feed", "loopback"]);
+
+        let plan = plan.without_loopback();
+        assert_eq!(plan.members(), ["komplete", "feed"]);
+        assert_eq!(plan.resampled(), ["feed"]);
+        assert_eq!(plan.layout.loopback_input(), None);
+        assert_eq!(plan.layout.input_usage(), [true]);
+        assert_eq!(plan.layout.output_usage(), [false, true]);
+        // The devices the daemon asked for stay, so it does not take the engine for stale.
+        assert!(plan.path == path);
     }
 
     fn string(value: &CFType) -> String {
@@ -976,8 +1171,8 @@ mod tests {
     #[test]
     fn the_aggregate_description_lists_the_clock_and_then_the_resampled_devices() {
         let plain = describe_aggregate("komplete-uid", &["feed-uid"]);
-        let routed = describe_aggregate("komplete-uid", &["feed-uid", "loopback-uid"]);
-        for description in [&plain, &routed] {
+        let with_loopback = describe_aggregate("komplete-uid", &["feed-uid", "loopback-uid"]);
+        for description in [&plain, &with_loopback] {
             assert_eq!(description.len(), 6);
             let get = |name: &CStr| description.get(&key(name)).unwrap();
             assert_eq!(string(&get(c"uid")), aggregate_uid());
@@ -993,7 +1188,7 @@ mod tests {
             [("komplete-uid".to_owned(), 0), ("feed-uid".to_owned(), 1)]
         );
         assert_eq!(
-            members(&routed, c"subdevices"),
+            members(&with_loopback, c"subdevices"),
             [
                 ("komplete-uid".to_owned(), 0),
                 ("feed-uid".to_owned(), 1),

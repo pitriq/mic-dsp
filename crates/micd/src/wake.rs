@@ -19,8 +19,6 @@ pub const ALIVE: u32 = 1 << 2;
 pub const RESTARTED: u32 = 1 << 3;
 /// The Komplete's sample rate changed.
 pub const RATE: u32 = 1 << 4;
-/// An app started or stopped playing to Francisco's Speakers.
-pub const PLAYING: u32 = 1 << 5;
 
 static PENDING: AtomicU32 = AtomicU32::new(0);
 static QUEUE: AtomicI32 = AtomicI32::new(-1);
