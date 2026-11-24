@@ -109,9 +109,11 @@ impl Chain {
         self.process_with_reference(input, in_channels, &[], 1, output, out_channels);
     }
 
-    /// `process`, with channel 0 of interleaved `reference` as the far end for the echo
-    /// canceller: what plays out of the speakers or headphones during this callback. A
-    /// reference shorter than the input counts as silence for the rest.
+    /// `process`, with interleaved `reference` as the far end for the echo canceller: what
+    /// plays out of the speakers or headphones during this callback. The canceller is mono, so
+    /// it gets the mean of the reference's channels, which is what a mic at the same distance
+    /// from both speakers hears. A reference shorter than the input counts as silence for the
+    /// rest.
     pub fn process_with_reference(
         &mut self,
         input: &[f32],
@@ -143,9 +145,12 @@ impl Chain {
         };
         debug_assert!(input.len() == frames * in_channels && output.len() == frames * out_channels);
         let (heard, silent) = output.split_at_mut(frames * out_channels);
+        // With one channel the mean is the channel itself, bit for bit.
+        let reference_channels = reference_channels.max(1);
+        let scale = 1.0 / reference_channels as f32;
         let far = reference
-            .chunks_exact(reference_channels.max(1))
-            .map(|frame| frame[0])
+            .chunks_exact(reference_channels)
+            .map(|frame| frame.iter().sum::<f32>() * scale)
             .chain(std::iter::repeat(0.0));
         self.core.reblock(
             input.chunks_exact(in_channels.max(1)).map(|frame| frame[0]),
@@ -458,6 +463,50 @@ mod tests {
         let echo = control.status().echo;
         assert!(!echo.active);
         assert_eq!(echo.active_frames, 300);
+    }
+
+    #[test]
+    fn the_far_end_is_the_mean_of_the_reference_channels() {
+        // Two different programmes on the two channels, and their echo in the mic.
+        let left = speechlike(6.0, 11, 1.0).samples;
+        let right = noise(left.len(), 0.05, 12);
+        let mean: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .map(|(l, r)| (l + r) * 0.5)
+            .collect();
+        let stereo: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(l, r)| [*l, *r])
+            .collect();
+        let mic: Vec<f32> = (0..left.len())
+            .map(|i| i.checked_sub(480).map_or(0.0, |j| 0.5 * mean[j]))
+            .collect();
+
+        let run = |reference: &[f32], channels: usize| {
+            let (mut chain, mut control) = default_chain();
+            let mut output = vec![0.0; mic.len()];
+            for ((x, r), y) in mic
+                .chunks(512)
+                .zip(reference.chunks(512 * channels))
+                .zip(output.chunks_mut(512))
+            {
+                chain.process_with_reference(x, 1, r, channels, y, 1);
+            }
+            (output, control.status().echo)
+        };
+        let (expected, heard) = run(&mean, 1);
+        assert!(heard.active && heard.far_frames > 100, "{heard:?}");
+        let (output, status) = run(&stereo, 2);
+        assert!(output == expected);
+        assert_eq!(status, heard);
+
+        // Sound on the second channel alone is half as loud a far end, not silence.
+        let second: Vec<f32> = left.iter().flat_map(|l| [0.0, *l]).collect();
+        let halved: Vec<f32> = left.iter().map(|l| l * 0.5).collect();
+        assert!(run(&second, 2).0 == run(&halved, 1).0);
+        assert!(run(&second, 2).1.far_frames > 100);
     }
 
     #[test]

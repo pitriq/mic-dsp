@@ -26,7 +26,7 @@ fn signal(frames: usize) -> Vec<f32> {
 }
 
 /// A far end that plays for a while, stops long enough for the echo canceller to go idle,
-/// and plays again.
+/// and plays again. Its two channels differ in level, so the chain has to mix them.
 fn far_end(frames: usize) -> Vec<f32> {
     signal(frames)
         .chunks(2)
@@ -34,7 +34,7 @@ fn far_end(frames: usize) -> Vec<f32> {
         .flat_map(|(i, frame)| {
             let playing = !(60_000..120_000).contains(&i);
             let sample = if playing { 4.0 * frame[0] } else { 0.0 };
-            [sample, sample]
+            [sample, 0.5 * sample]
         })
         .collect()
 }
