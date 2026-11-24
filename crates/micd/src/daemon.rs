@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyDeviceIsRunningSomewhere,
-    kAudioDevicePropertyNominalSampleRate, kAudioHardwarePropertyDevices,
-    kAudioHardwarePropertyServiceRestarted,
+    kAudioDevicePropertyNominalSampleRate, kAudioDeviceTransportTypeAggregate,
+    kAudioHardwarePropertyDevices, kAudioHardwarePropertyServiceRestarted,
 };
 
 use dsp::{Chain, Control, EchoStatus, Status};
@@ -21,7 +21,8 @@ use crate::permission::{self, Permission};
 use crate::settings::{self, Settings};
 use crate::{io, wake};
 
-/// The interface is matched by name. Its UID carries a serial number.
+/// The interface is matched by name. Its UID carries a serial number. `is_komplete` does the
+/// matching.
 const KOMPLETE_NAME: &str = "Komplete Audio 1";
 /// The visible, input-only "Francisco's Mic".
 const MIC_UID: &str = "MicDSP_UID";
@@ -56,12 +57,19 @@ struct Devices {
 
 impl Devices {
     fn find() -> Devices {
-        let named = |device: &ObjectId| hal::name(*device).is_ok_and(|n| n.contains(KOMPLETE_NAME));
+        let komplete = |device: &ObjectId| {
+            // A device that does not say how it is connected is not known to be an aggregate.
+            let transport = hal::transport_type(*device).unwrap_or(0);
+            hal::name(*device).is_ok_and(|name| is_komplete(&name, transport))
+        };
         let by_uid = |uid| hal::device_for_uid(uid).ok().flatten();
         Devices {
             mic: by_uid(MIC_UID),
             feed: by_uid(FEED_UID),
-            komplete: hal::devices().unwrap_or_default().into_iter().find(named),
+            komplete: hal::devices()
+                .unwrap_or_default()
+                .into_iter()
+                .find(komplete),
             speakers: by_uid(SPEAKERS_UID),
             loopback: by_uid(LOOPBACK_UID),
         }
@@ -77,6 +85,13 @@ impl Devices {
             loopback: self.loopback,
         })
     }
+}
+
+/// Whether a device with this name and transport type (a `kAudioDeviceTransportType` constant)
+/// is the interface. An aggregate is not: the owner's Multi-Output Device has the Komplete in
+/// it and may be named after it.
+fn is_komplete(name: &str, transport: u32) -> bool {
+    transport != kAudioDeviceTransportTypeAggregate && name.contains(KOMPLETE_NAME)
 }
 
 /// When to try starting the engine again after it failed to start.
@@ -700,6 +715,29 @@ mod tests {
             "echo canceller active 25% of the time, removed 20.0 dB in far-end-only frames, \
              ERLE 18.3 dB, echo path at 8 ms after the reference"
         );
+    }
+
+    #[test]
+    fn an_aggregate_named_after_the_komplete_is_not_the_komplete() {
+        use objc2_core_audio::{kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeVirtual};
+
+        let usb = kAudioDeviceTransportTypeUSB;
+        assert!(is_komplete("Komplete Audio 1", usb));
+        assert!(is_komplete("Komplete Audio 1 (2)", usb));
+        // A device that does not say how it is connected.
+        assert!(is_komplete("Komplete Audio 1", 0));
+        // The owner's Multi-Output Device, whatever it is called.
+        let aggregate = kAudioDeviceTransportTypeAggregate;
+        assert_eq!(aggregate, u32::from_be_bytes(*b"grup"));
+        assert!(!is_komplete("Komplete + Echo", aggregate));
+        assert!(!is_komplete("Komplete Audio 1 + Echo", aggregate));
+        assert!(!is_komplete("Komplete Audio 1", aggregate));
+        // Other devices, by name.
+        assert!(!is_komplete("Komplete Audio 2", usb));
+        assert!(!is_komplete(
+            "Francisco's Speakers",
+            kAudioDeviceTransportTypeVirtual
+        ));
     }
 
     #[test]
