@@ -12,6 +12,7 @@ macro_rules! log {
     };
 }
 
+mod capture;
 mod daemon;
 mod engine;
 mod hal;

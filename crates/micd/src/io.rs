@@ -14,6 +14,8 @@ use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 
 use dsp::Chain;
 
+use crate::capture::Capture;
+
 #[repr(C)]
 struct Timebase {
     numer: u32,
@@ -78,6 +80,8 @@ pub struct Context {
     chain: UnsafeCell<Chain>,
     buffers: Buffers,
     pub stats: Stats,
+    /// A debug recording, when one was asked for.
+    pub capture: Option<Box<Capture>>,
 }
 
 // `chain` is only reached through `render`, which only the IO thread calls, one callback at a
@@ -85,11 +89,12 @@ pub struct Context {
 unsafe impl Sync for Context {}
 
 impl Context {
-    pub fn new(chain: Chain, buffers: Buffers) -> Box<Context> {
+    pub fn new(chain: Chain, buffers: Buffers, capture: Option<Box<Capture>>) -> Box<Context> {
         Box::new(Context {
             chain: UnsafeCell::new(chain),
             buffers,
             stats: Stats::default(),
+            capture,
         })
     }
 
@@ -111,7 +116,12 @@ impl Context {
     ///
     /// The lists must be the ones the HAL passed to the IOProc, and only the IO thread may call
     /// this.
-    unsafe fn render(&self, input: *const AudioBufferList, output: *const AudioBufferList) {
+    unsafe fn render(
+        &self,
+        input: *const AudioBufferList,
+        output: *const AudioBufferList,
+        times: [&AudioTimeStamp; 3],
+    ) {
         let started = unsafe { mach_absolute_time() };
         self.stats.in_callback.store(true, Ordering::Release);
         let chain = unsafe { &mut *self.chain.get() };
@@ -144,6 +154,24 @@ impl Context {
                     feed_channels,
                 );
                 rest.fill(0.0);
+                if let Some(capture) = &self.capture {
+                    let [now, input_time, output_time] = times;
+                    capture.record(
+                        [
+                            (source, source_channels),
+                            (reference, reference_channels),
+                            (&*feed, feed_channels),
+                        ],
+                        frames,
+                        [
+                            now.mSampleTime,
+                            input_time.mSampleTime,
+                            output_time.mSampleTime,
+                            input_time.mHostTime as f64,
+                            frames as f64,
+                        ],
+                    );
+                }
             }
             (None, Some((feed, _))) => {
                 feed.fill(0.0);
@@ -196,17 +224,18 @@ unsafe fn samples<'a>(
 /// The `AudioDeviceIOProc` registered on the aggregate.
 pub unsafe extern "C-unwind" fn io_proc(
     _device: AudioObjectID,
-    _now: NonNull<AudioTimeStamp>,
+    now: NonNull<AudioTimeStamp>,
     input: NonNull<AudioBufferList>,
-    _input_time: NonNull<AudioTimeStamp>,
+    input_time: NonNull<AudioTimeStamp>,
     output: NonNull<AudioBufferList>,
-    _output_time: NonNull<AudioTimeStamp>,
+    output_time: NonNull<AudioTimeStamp>,
     client: *mut c_void,
 ) -> i32 {
     // `client` is the `Context` the engine registered, which outlives the IOProc.
     let context = unsafe { &*client.cast::<Context>() };
     // A debug build aborts if anything in here allocates.
-    assert_no_alloc(|| unsafe { context.render(input.as_ptr(), output.as_ptr()) });
+    let times = unsafe { [now.as_ref(), input_time.as_ref(), output_time.as_ref()] };
+    assert_no_alloc(|| unsafe { context.render(input.as_ptr(), output.as_ptr(), times) });
     0
 }
 
@@ -240,7 +269,7 @@ mod tests {
             reference: None,
             feed: 1,
         };
-        let context = Context::new(chain, buffers);
+        let context = Context::new(chain, buffers, None);
         let time = unsafe { std::mem::zeroed::<AudioTimeStamp>() };
         let mut feed = vec![7.0f32; 2 * 600];
         let mut phase = 0.0f32;
@@ -307,7 +336,7 @@ mod tests {
             reference: Some(1),
             feed: 1,
         };
-        let context = Context::new(chain, buffers);
+        let context = Context::new(chain, buffers, None);
         let time = unsafe { std::mem::zeroed::<AudioTimeStamp>() };
         let mut feed = vec![7.0f32; 2 * 512];
         let mut phase = 0.0f32;

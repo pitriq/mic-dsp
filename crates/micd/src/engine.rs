@@ -20,8 +20,9 @@ use objc2_core_audio::{
     kAudioDevicePropertyLatency, kAudioDevicePropertySafetyOffset,
     kAudioObjectPropertyOwnedObjects, kAudioObjectUnknown, kAudioStreamPropertyLatency,
     kAudioSubDeviceClassID, kAudioSubDeviceDriftCompensationKey,
-    kAudioSubDevicePropertyDriftCompensation, kAudioSubDeviceUIDKey,
-    kAudioSubTapDriftCompensationKey, kAudioSubTapUIDKey, AudioDeviceCreateIOProcID,
+    kAudioSubDevicePropertyDriftCompensation, kAudioSubDeviceUIDKey, kAudioSubTapClassID,
+    kAudioSubTapDriftCompensationKey, kAudioSubTapPropertyDriftCompensation,
+    kAudioSubTapPropertyExtraLatency, kAudioSubTapUIDKey, AudioDeviceCreateIOProcID,
     AudioDeviceDestroyIOProcID, AudioDeviceIOProcID, AudioDeviceStart, AudioDeviceStop,
     AudioHardwareCreateAggregateDevice, AudioHardwareDestroyAggregateDevice,
 };
@@ -29,6 +30,7 @@ use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFStrin
 
 use dsp::Chain;
 
+use crate::capture::Capture;
 use crate::hal::{self, ObjectId, GLOBAL, INPUT, OUTPUT};
 use crate::io::{self, Buffers, Context, Stats};
 use crate::permission::{self, Permission};
@@ -109,7 +111,12 @@ impl Engine {
     /// not to try, System Audio Recording is denied or the tap can't be made. If the aggregate
     /// with the tap fails to build or start, the engine builds it again without, which is the
     /// aggregate micd ran on before it had an echo canceller.
-    pub fn start(path: Path, chain: Chain, skip_tap: Option<&str>) -> Result<Engine, Error> {
+    pub fn start(
+        path: Path,
+        chain: Chain,
+        skip_tap: Option<&str>,
+        capture: Option<Box<Capture>>,
+    ) -> Result<Engine, Error> {
         let plan = Plan::read(path)?;
         let permission = permission::system_audio();
         let denied = matches!(permission, Permission::Denied);
@@ -135,7 +142,7 @@ impl Engine {
             listening: false,
             buffer_frames: 0,
             stuck: false,
-            context: ManuallyDrop::new(Context::new(chain, Buffers::default())),
+            context: ManuallyDrop::new(Context::new(chain, Buffers::default(), capture)),
         };
         if matches!(engine.reference, Reference::Tap(_)) {
             if let Err(error) = engine.build(&plan) {
@@ -278,6 +285,7 @@ impl Engine {
             drift,
         );
         self.report_latency(plan.path, cycle_usage);
+        report_members(self.aggregate);
 
         hal::add_listener(aggregate, kAudioDevicePropertyDeviceIsAlive, wake::ALIVE)?;
         self.listening = true;
@@ -471,6 +479,12 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.dismantle() {
+            if let Some(capture) = &self.context.capture {
+                match capture.write() {
+                    Ok(path) => log!("capture written to {}", path.display()),
+                    Err(error) => log!("could not write the capture: {error}"),
+                }
+            }
             // The IOProc is stopped and destroyed, so nothing else refers to the context.
             unsafe { ManuallyDrop::drop(&mut self.context) };
         }
@@ -774,6 +788,48 @@ fn float_channels(stream: ObjectId, what: &str) -> Result<u32, Error> {
             hal::describe_format(&format)
         ))
     })
+}
+
+/// Logs what each member of the aggregate reports about its timing, in frames: latency and
+/// safety offset per direction, and drift compensation.
+fn report_members(aggregate: ObjectId) {
+    let read = |object: ObjectId, selector: u32, scope: u32| {
+        hal::get::<u32>(object, selector, scope).map_or("-".to_owned(), |value| value.to_string())
+    };
+    let mut members = Vec::new();
+    for (class, kind, drift) in [
+        (
+            kAudioSubDeviceClassID,
+            "device",
+            kAudioSubDevicePropertyDriftCompensation,
+        ),
+        (
+            kAudioSubTapClassID,
+            "tap",
+            kAudioSubTapPropertyDriftCompensation,
+        ),
+    ] {
+        let objects: Vec<ObjectId> = hal::get_list_qualified(
+            aggregate,
+            kAudioObjectPropertyOwnedObjects,
+            GLOBAL,
+            &[class],
+        )
+        .unwrap_or_default();
+        for object in objects {
+            members.push(format!(
+                "{kind} {object} ({}): latency in {} out {}, safety in {} out {}, drift {}, extra latency {}",
+                hal::uid(object).unwrap_or_default(),
+                read(object, kAudioDevicePropertyLatency, INPUT),
+                read(object, kAudioDevicePropertyLatency, OUTPUT),
+                read(object, kAudioDevicePropertySafetyOffset, INPUT),
+                read(object, kAudioDevicePropertySafetyOffset, OUTPUT),
+                read(object, drift, GLOBAL),
+                read(object, kAudioSubTapPropertyExtraLatency, GLOBAL),
+            ));
+        }
+    }
+    log!("aggregate members: {}", members.join("; "));
 }
 
 #[cfg(test)]

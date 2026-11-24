@@ -1,6 +1,7 @@
 //! The control thread. It owns every Core Audio object micd creates, and all building and
 //! tearing down happens here. Listeners and signals only wake it.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ use objc2_core_audio::{
 
 use dsp::{Control, EchoStatus, Status};
 
+use crate::capture::Capture;
 use crate::engine::{self, Engine};
 use crate::hal::{self, ObjectId};
 use crate::permission::{self, Permission};
@@ -78,6 +80,8 @@ enum Retry {
 }
 
 struct Daemon {
+    /// `~/.config/mic-dsp`.
+    config_dir: PathBuf,
     devices: Devices,
     /// Listeners on device objects: (object, selector, event).
     listeners: Vec<(ObjectId, u32, u32)>,
@@ -124,9 +128,10 @@ const SYSTEM_LISTENERS: [(u32, u32); 2] = [
 ];
 
 impl Daemon {
-    fn new(settings: Settings) -> Daemon {
+    fn new(settings: Settings, config_dir: PathBuf) -> Daemon {
         let now = Instant::now();
         Daemon {
+            config_dir,
             devices: Devices::default(),
             listeners: Vec::new(),
             engine: None,
@@ -291,7 +296,7 @@ impl Daemon {
             self.tap_off = None;
         }
         let skip_tap = self.tap_off.as_ref().map(|(why, _)| why.as_str());
-        match Engine::start(path, chain, skip_tap) {
+        match Engine::start(path, chain, skip_tap, Capture::requested(&self.config_dir)) {
             Ok(engine) => {
                 let now = Instant::now();
                 if let Some(why) = engine.tap_failure() {
@@ -536,7 +541,7 @@ pub fn run() -> ExitCode {
     if let Err(error) = hal::use_hal_notification_thread() {
         log!("{error}");
     }
-    let mut daemon = Daemon::new(Settings::new(&dir));
+    let mut daemon = Daemon::new(Settings::new(&dir), dir.clone());
     daemon.listen_to_system();
     {
         let _pool = objc::Pool::new();
