@@ -45,11 +45,11 @@ const TICK: Duration = Duration::from_secs(1);
 const IDLE_CHECK: Duration = Duration::from_secs(30);
 const FIRST_RETRY: Duration = Duration::from_secs(1);
 const LAST_RETRY: Duration = Duration::from_secs(8);
-/// How long starts leave out the loopback after an engine with it stalled, before they try it
-/// again.
+/// How long starts leave out the loopback after an engine with it stalled or failed to start
+/// with it, before they try it again.
 const LOOPBACK_RETRY: Duration = Duration::from_secs(10 * 60);
 /// Why starts leave the loopback out in that time.
-const LOOPBACK_STALLED: &str = "the IOProc stalled with the loopback";
+const LOOPBACK_STALLED: &str = "the loopback failed or stalled an engine recently";
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Devices {
@@ -130,9 +130,9 @@ struct Daemon {
     /// How long the next failed start or stall puts the start after it off. It doubles each
     /// time and starts over once an IOProc is seen running, or no app reads the mic.
     retry_delay: Duration,
-    /// Since when starts leave the loopback out: the IOProc of an engine with it stalled. The
-    /// mic matters more than the echo canceller, so the loopback is not tried again on every
-    /// rebuild. It is after `LOOPBACK_RETRY`, in case the stall had another cause, or as soon
+    /// Since when starts leave the loopback out: an engine failed to start with it, or its
+    /// IOProc stalled with it. The mic matters more than the echo canceller, so the loopback is
+    /// not tried again on every start. It is after `LOOPBACK_RETRY`, in case the stall had another cause, or as soon
     /// as the devices change.
     loopback_off: Option<Instant>,
     /// The last start failure that was logged, so a failure that repeats is logged once.
@@ -355,6 +355,9 @@ impl Daemon {
                 let now = Instant::now();
                 if let Ok(delay) = engine.far_end() {
                     control.set_echo_delay(delay);
+                }
+                if engine.loopback_failed() {
+                    self.loopback_off = Some(now);
                 }
                 self.engine = Some(engine);
                 self.control = Some(control);

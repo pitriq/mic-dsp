@@ -390,6 +390,12 @@ impl Engine {
         self.path
     }
 
+    /// Whether this engine tried the loopback and had to start without it. The next starts
+    /// leave it out for a while, so a failure that repeats doesn't delay every mic session.
+    pub fn loopback_failed(&self) -> bool {
+        matches!(&self.far_end, Err(why) if why.starts_with(WITH_THE_LOOPBACK))
+    }
+
     /// The echo delay to give the chain, in samples, or why the chain gets no far end.
     pub fn far_end(&self) -> Result<usize, &str> {
         match &self.far_end {
@@ -512,6 +518,9 @@ struct Parts {
     resampled: Vec<ObjectId>,
 }
 
+/// How the reason starts when an engine fell back to running without the loopback.
+const WITH_THE_LOOPBACK: &str = "with the loopback, ";
+
 /// Runs `attempt` on `plan`. When that fails on a plan with the loopback, it runs once more on
 /// the plan without it, as long as `dismantle` shows that nothing of the first attempt can
 /// still run: the chain lives in the context, which a second IOProc can only have once the
@@ -530,7 +539,7 @@ fn build_with<E>(
         if plan.loopback.is_err() || !dismantle(engine) {
             return Err(error);
         }
-        let why = format!("with the loopback, {error}");
+        let why = format!("{WITH_THE_LOOPBACK}{error}");
         log!("{why}; starting without it, so the echo canceller has no far end");
         plan = plan.without_loopback(why);
     }

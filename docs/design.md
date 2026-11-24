@@ -24,7 +24,8 @@ How mic-dsp works and why. Update it when a decision changes.
     - The driver of Francisco's Speakers is not installed.
     - The loopback can't be read, is not at 48 kHz or has no input stream.
     - The aggregate with the loopback fails to build or to start: its streams don't appear, their order is not confirmed, or the loopback's stream is not Float32. micd destroys it and builds one without the loopback, once. It does that only when the first aggregate's IOProc is provably gone, because both run on the same chain.
-    - The IOProc of an engine with the loopback stopped being called. The engines after it leave the loopback out for 10 minutes, or until the devices change.
+    - The IOProc of an engine with the loopback stopped being called.
+    - After either of the last two, the engines that follow leave the loopback out for 10 minutes, or until the devices change, so a failure that repeats doesn't delay every mic session.
   - When the driver is installed but the output is not the Multi-Output Device, the engine reads the loopback and nothing reaches it, so the canceller stays idle.
   - Listeners on the device list, `DeviceIsAlive`, the sample rate, `ServiceRestarted` and the mic's `DeviceIsRunningSomewhere` only signal a kqueue; the control thread rebuilds the aggregate. A watchdog stops the engine when the IOProc has not been called for 2 s and builds a new one 1 s later. Engines that stall one after another wait twice as long each time, up to 8 s, like starts that fail.
   - The Komplete is found by its name. Aggregates are skipped, because the Multi-Output Device has the Komplete in it and may be named after it.
