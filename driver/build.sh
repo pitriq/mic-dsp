@@ -66,10 +66,11 @@ kCanBeDefaultDevice=true
 kCanBeDefaultSystemDevice=false
 EOF
 
-# Francisco's Speakers. Visible device: output only, the Mac's default output. Device 2: hidden,
-# input only (the loopback the daemon reads what was played from).
-# BlackHole applies the volume where the input side is read, so the volume keys work and the
-# daemon reads what it should play.
+# Francisco's Speakers. Visible device: output only, a member of the owner's Multi-Output Device
+# next to the Komplete. Nobody listens to it directly. Device 2: hidden, input only (the loopback
+# the daemon reads as the echo canceller's reference).
+# The volume control stays on. BlackHole applies the volume where the loopback is read, so the
+# device's slider sets the level of the reference and should stay at full.
 build MicDSPSpeakers local.mic-dsp.speakers 56b18a31-ab1b-4248-80ab-1977113152b7 <<'EOF'
 kDevice_Name=\"Francisco\'s\ Speakers\"
 kDevice2_Name=\"Francisco\'s\ Speakers\ Loopback\"
