@@ -14,6 +14,7 @@ use crate::stages::gain::Gain;
 use crate::stages::highpass::Highpass;
 use crate::stages::limiter::{self, Limiter};
 use crate::stages::{lin_to_db, Stage};
+use crate::EchoStateError;
 use crate::{FRAME, SAMPLE_RATE};
 
 /// Builds the chain and its control handle. It allocates everything the chain will ever
@@ -166,10 +167,40 @@ fn mean_of(reference: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_
         .chain(std::iter::repeat(0.0))
 }
 
+/// What the echo canceller has learned, saved and loaded. These allocate, so they are for the
+/// control thread, which has the chain to itself between two engines.
+impl Chain {
+    /// Replaces what the echo canceller has learned with a saved state, so that it cancels
+    /// from its first frame. After an error nothing has changed.
+    pub fn load_echo_preset(&mut self, state: &[u8]) -> Result<(), EchoStateError> {
+        let loaded = self.core.echo.load(state);
+        self.status.publish(self.core.status());
+        loaded
+    }
+
+    /// Starts a session, before the engine that runs it: [`EchoStatus::echo_level_db`] is
+    /// measured anew. With `candidate`, a second saved state, the session starts as a trial
+    /// of the canceller as it is against a second one loaded with it: both run until 2 s of
+    /// frames had far end in them or one is clearly ahead, the one that put out less stays,
+    /// and [`EchoStatus::trial`] says which. Without one, or with one that is refused, there
+    /// is no trial.
+    pub fn start_echo_session(&mut self, candidate: Option<&[u8]>) -> Result<(), EchoStateError> {
+        let loaded = self.core.echo.start_session(candidate);
+        self.status.publish(self.core.status());
+        loaded
+    }
+
+    /// What the echo canceller in use has learned, for the two calls above. `None` until it
+    /// has heard 2.5 s of far end.
+    pub fn echo_state(&self) -> Option<Vec<u8>> {
+        self.core.echo.state()
+    }
+}
+
 #[cfg(feature = "offline")]
 impl Chain {
     /// What the echo canceller made of the latest frame, before the gain.
-    pub(crate) fn echo_output(&self) -> &[f32; FRAME] {
+    pub fn echo_output(&self) -> &[f32; FRAME] {
         &self.core.echo_output
     }
 }
@@ -511,6 +542,58 @@ mod tests {
         let halved: Vec<f32> = left.iter().map(|l| l * 0.5).collect();
         assert!(run(&second, 2).0 == run(&halved, 1).0);
         assert!(run(&second, 2).1.far_frames > 100);
+    }
+
+    /// What one chain's canceller has learned starts another chain's session: without the
+    /// warm-up, and without the echo.
+    #[test]
+    fn a_saved_echo_state_starts_another_chain() {
+        use crate::EchoTrial;
+
+        // A far end at the level calls play at, and its echo 10 dB under it.
+        let far: Vec<f32> = speechlike(12.0, 21, 1.0)
+            .samples
+            .iter()
+            .map(|x| 3.0 * x)
+            .collect();
+        let room = noise(far.len(), 0.0005, 22);
+        let mic: Vec<f32> = (0..far.len())
+            .map(|i| room[i] + i.checked_sub(480).map_or(0.0, |j| 0.3 * far[j]))
+            .collect();
+        let run = |chain: &mut Chain, range: std::ops::Range<usize>| {
+            let mut output = [0.0f32; 512];
+            for (x, r) in mic[range.clone()].chunks(512).zip(far[range].chunks(512)) {
+                chain.process_with_reference(x, 1, r, 1, &mut output[..x.len()], 1);
+            }
+        };
+
+        let (mut first, _) = default_chain();
+        assert_eq!(first.echo_state(), None);
+        run(&mut first, 0..9 * 48_000);
+        let state = first
+            .echo_state()
+            .expect("a canceller that heard 9 s of far end");
+
+        let (mut second, mut control) = default_chain();
+        second.load_echo_preset(&state).unwrap();
+        // The control handle sees a session start before any callback runs.
+        second.start_echo_session(Some(&state)).unwrap();
+        assert_eq!(control.status().echo.trial, EchoTrial::Running);
+        // A state that is refused changes nothing but the trial, which is off.
+        assert!(second.start_echo_session(Some(&state[..1000])).is_err());
+        assert_eq!(control.status().echo.trial, EchoTrial::None);
+        assert!(second.load_echo_preset(b"not a state").is_err());
+        assert!(second.echo_state() == Some(state.clone()));
+
+        // No warm-up: the canceller does not run before something plays.
+        process(&mut second, &room[..24_000], || 512);
+        assert_eq!(control.status().echo.active_frames, 0);
+        run(&mut second, 9 * 48_000..12 * 48_000);
+        let echo = control.status().echo;
+        let removed = echo.removed_db_since(&EchoStatus::default()).unwrap();
+        assert!(removed > 20.0, "removed {removed} dB");
+        let level = echo.echo_level_db.unwrap();
+        assert!((8.0..20.0).contains(&level), "{level} dB");
     }
 
     #[test]

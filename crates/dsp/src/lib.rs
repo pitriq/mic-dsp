@@ -29,7 +29,10 @@ mod stages;
 
 pub use chain::{chain, Chain, Control, Status};
 pub use config::{Config, ConfigError};
-pub use stages::echo::EchoStatus;
+pub use stages::echo::{EchoStatus, EchoTrial};
+
+/// Why [`Chain::load_echo_preset`] or [`Chain::try_echo_preset`] refused a saved state.
+pub use aec3::StateError as EchoStateError;
 
 /// The only rate the chain runs at.
 pub const SAMPLE_RATE: u32 = 48_000;

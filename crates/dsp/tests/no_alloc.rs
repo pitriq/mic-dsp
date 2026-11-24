@@ -3,7 +3,7 @@
 //! `assert_no_alloc`.
 
 use assert_no_alloc::{assert_no_alloc, AllocDisabler};
-use dsp::{Chain, Config};
+use dsp::{Chain, Config, EchoTrial};
 
 #[global_allocator]
 static ALLOCATOR: AllocDisabler = AllocDisabler;
@@ -105,4 +105,80 @@ fn process_never_allocates() {
         std::thread::yield_now();
     }
     drop(worker.join().unwrap());
+}
+
+/// A far end of noise in bursts, which a canceller can learn from, and the mic that hears it
+/// 10 ms later at `gain` over faint noise. Both interleaved stereo.
+fn call(frames: usize, gain: f32) -> (Vec<f32>, Vec<f32>) {
+    let mut seed = 0x1234_5678u32;
+    let mut noise = move || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1 << 23) as f32 - 1.0
+    };
+    let mut low = 0.0f32;
+    let far: Vec<f32> = (0..frames)
+        .map(|i| {
+            low += 0.3 * (noise() - low);
+            if (i / 28_800) % 5 < 4 {
+                0.5 * low
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mic = (0..frames).flat_map(|i| {
+        let x = 0.0005 * noise() + i.checked_sub(480).map_or(0.0, |j| gain * far[j]);
+        [x, x]
+    });
+    let mic = mic.collect();
+    (far.iter().flat_map(|x| [*x, *x]).collect(), mic)
+}
+
+/// Callbacks of 512 frames on a thread of their own, inside `assert_no_alloc`.
+fn session(mut chain: Chain, far: Vec<f32>, mic: Vec<f32>) -> Chain {
+    std::thread::spawn(move || {
+        let mut output = [0.0f32; 2 * 512];
+        for (x, r) in mic.chunks(2 * 512).zip(far.chunks(2 * 512)) {
+            let y = &mut output[..x.len()];
+            assert_no_alloc(|| chain.process_with_reference(x, 2, r, 2, y, 2));
+        }
+        chain
+    })
+    .join()
+    .unwrap()
+}
+
+/// What a chain's canceller has learned from 8 s of an echo at `gain`.
+fn learned(gain: f32) -> Vec<u8> {
+    let (chain, _control) = dsp::chain(&Config::default());
+    let (far, mic) = call(8 * 48_000, gain);
+    // Saving allocates, on the thread that asks for it.
+    session(chain, far, mic)
+        .echo_state()
+        .expect("8 s of far end train the canceller")
+}
+
+/// A session that starts with two saved states runs both cancellers, decides and crosses
+/// over to the winner, all on memory the chain had from the start or that the control thread
+/// loaded into it.
+#[test]
+fn a_session_that_tries_two_echo_states_never_allocates() {
+    let (strong, weak) = (learned(0.3), learned(0.003));
+    let (mut chain, mut control) = dsp::chain(&Config::default());
+    chain.load_echo_preset(&weak).unwrap();
+    chain.start_echo_session(Some(&strong)).unwrap();
+    assert_eq!(control.status().echo.trial, EchoTrial::Running);
+
+    let (far, mic) = call(4 * 48_000, 0.3);
+    let mut chain = session(chain, far.clone(), mic.clone());
+    let echo = control.status().echo;
+    assert_eq!(echo.trial, EchoTrial::Switched, "{echo:?}");
+    assert!(echo.far_frames > 100);
+
+    // The next session on the same chain tries the state that lost against the one in use.
+    chain.start_echo_session(Some(&weak)).unwrap();
+    let chain = session(chain, far, mic);
+    let echo = control.status().echo;
+    assert_eq!(echo.trial, EchoTrial::Kept, "{echo:?}");
+    assert!(chain.echo_state().is_some());
 }

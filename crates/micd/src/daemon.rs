@@ -713,6 +713,7 @@ mod tests {
                 far_out: far.2,
                 erle_db: 18.26,
                 echo_delay_ms: 8.0,
+                ..EchoStatus::default()
             },
             missing: 0,
         }

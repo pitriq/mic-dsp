@@ -9,7 +9,7 @@ pub use echo::{EchoInput, EchoReport};
 pub use report::{Levels, Report};
 
 use crate::stages::testing;
-use crate::{Chain, Config, Status, FRAME, SAMPLE_RATE};
+use crate::{Chain, Config, EchoTrial, Status, FRAME, SAMPLE_RATE};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -118,10 +118,13 @@ struct Run {
 }
 
 /// The time `Chain::process_with_reference` takes per 10 ms stereo callback, with the far end
-/// silent and with it playing.
+/// silent, with it playing, and with it playing while a session tries two saved echo states,
+/// which is when both cancellers run.
 pub struct Bench {
     silent: Timing,
     playing: Timing,
+    /// `None` when the input is too short to train a canceller for the states.
+    trying: Option<Timing>,
 }
 
 struct Timing {
@@ -142,30 +145,55 @@ pub fn bench(input: Option<&Path>) -> Result<Bench, Error> {
         Some(path) => wav::read(path)?,
         None => testing::speechlike(60.0, 1, 1.0).samples,
     };
-    let silent = time(&mono, &vec![0.0; mono.len()]);
+    let silent = time(&mono, &vec![0.0; mono.len()], None).0;
     let far = testing::speechlike(mono.len() as f32 / SAMPLE_RATE as f32 + 1.0, 2, 1.0).samples;
     let echo = crate::stages::echo::DEFAULT_DELAY;
     let mic: Vec<f32> = (0..mono.len())
         .map(|i| mono[i] + i.checked_sub(echo).map_or(0.0, |j| 0.5 * far[j]))
         .collect();
-    let playing = time(&mic, &far[..mono.len()]);
-    Ok(Bench { silent, playing })
+    let far = &far[..mono.len()];
+    let (playing, state) = time(&mic, far, None);
+    let trying = state.map(|state| time(&mic, far, Some(&state)).0);
+    Ok(Bench {
+        silent,
+        playing,
+        trying,
+    })
 }
 
-fn time(mono: &[f32], reference: &[f32]) -> Timing {
+/// Times a new chain over `mono`, and returns what its echo canceller has learned by the end.
+/// With `state`, a saved echo state, the chain starts from it and every session tries the same
+/// state against it: two cancellers that put out the same never part, so each trial lasts its
+/// whole 2 s of far end, and a new one starts when it ends. Only the callbacks in which both
+/// cancellers ran are timed then.
+fn time(mono: &[f32], reference: &[f32], state: Option<&[u8]>) -> (Timing, Option<Vec<u8>>) {
     let stereo = |mono: &[f32]| -> Vec<f32> { mono.iter().flat_map(|x| [*x, *x]).collect() };
     let (input, far) = (stereo(mono), stereo(reference));
     let mut out = [0.0f32; 2 * FRAME];
-    let (mut chain, _control) = crate::chain(&Config::default());
-    let mut micros: Vec<f64> = input
+    let (mut chain, mut control) = crate::chain(&Config::default());
+    if let Some(state) = state {
+        chain.load_echo_preset(state).expect("a state just saved");
+    }
+    let mut micros = Vec::with_capacity(input.len() / (2 * FRAME));
+    for (block, far) in input
         .chunks_exact(2 * FRAME)
         .zip(far.chunks_exact(2 * FRAME))
-        .map(|(block, far)| {
-            let start = Instant::now();
-            chain.process_with_reference(block, 2, far, 2, &mut out, 2);
-            start.elapsed().as_secs_f64() * 1e6
-        })
-        .collect();
+    {
+        if state.is_some() && control.status().echo.trial != EchoTrial::Running {
+            chain.start_echo_session(state).expect("a state just saved");
+        }
+        let start = Instant::now();
+        chain.process_with_reference(block, 2, far, 2, &mut out, 2);
+        let elapsed = start.elapsed().as_secs_f64() * 1e6;
+        if state.is_none() || control.status().echo.active {
+            micros.push(elapsed);
+        }
+    }
+    let timing = timing(micros);
+    (timing, chain.echo_state())
+}
+
+fn timing(mut micros: Vec<f64>) -> Timing {
     micros.sort_by(f64::total_cmp);
     let blocks = micros.len();
     Timing {
@@ -178,7 +206,7 @@ fn time(mono: &[f32], reference: &[f32]) -> Timing {
 
 impl Bench {
     pub fn pass(&self) -> bool {
-        self.silent.pass() && self.playing.pass()
+        self.silent.pass() && self.playing.pass() && self.trying.as_ref().is_none_or(Timing::pass)
     }
 }
 
@@ -190,7 +218,13 @@ impl Timing {
 
 impl fmt::Display for Bench {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for (what, timing) in [("silent", &self.silent), ("playing", &self.playing)] {
+        let timings = [
+            ("silent", Some(&self.silent)),
+            ("playing", Some(&self.playing)),
+            ("playing, two echo states tried", self.trying.as_ref()),
+        ];
+        for (what, timing) in timings {
+            let Some(timing) = timing else { continue };
             writeln!(
                 f,
                 "far end {what}: {} blocks of {FRAME} samples: mean {:.1} us, p99 {:.1} us, max {:.1} us: {}",
