@@ -548,4 +548,27 @@ mod tests {
         assert!(after.out_peak_dbfs > -60.0, "{}", after.out_peak_dbfs);
         assert_eq!(second.context.stats.callbacks.load(Ordering::Relaxed), 60);
     }
+
+    /// The chain is what outlives an engine. Taking it out of the context drops the debug
+    /// capture with the context, and the capture's memory goes back to the system there and
+    /// then, so micd's footprint is back to normal as soon as the capture is written.
+    #[test]
+    fn the_kept_chain_does_not_keep_the_capture() {
+        use crate::capture::{Capture, MAPPED};
+        let config = std::env::temp_dir().join(format!("micd-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("capture"), "2").unwrap();
+        let before = MAPPED.with(|mapped| mapped.get());
+        let capture = Capture::requested(&config).unwrap();
+        let held = MAPPED.with(|mapped| mapped.get()) - before;
+        // Two seconds of three streams of f32, and the rows.
+        assert!(held >= 2 * 48_000 * 3 * 4, "{held} bytes");
+
+        let (chain, _control) = dsp::chain(&dsp::Config::default());
+        let context = Context::new(Box::new(chain), Buffers::default(), Some(capture));
+        let chain = context.into_chain();
+        assert_eq!(MAPPED.with(|mapped| mapped.get()), before);
+        drop(chain);
+        let _ = std::fs::remove_dir_all(&config);
+    }
 }

@@ -5,6 +5,9 @@
 //! Komplete's channel 1, channel 1 of what the Mac plays (the loopback) and the feed's channel
 //! 1, plus the timestamps of every callback it stored frames from. It stops at that length.
 //! The buffers take 0.6 MB per second, about 23 MB for 40 s, for as long as the engine runs.
+//! They are mapped straight from the system and unmapped when the capture is dropped, right
+//! after it is written, so the footprint is back where it was at once: memory freed through
+//! malloc came back to the system only after a minute or two.
 //!
 //! Once the IOProc is gone the control thread writes them to
 //! `~/Library/Logs/mic-dsp/capture-<time>.wav` (three channels, 32-bit float) and `.csv`, and
@@ -31,9 +34,9 @@ pub type Times = [f64; 4];
 
 pub struct Capture {
     /// Interleaved mic, playback, feed. Only the IO thread writes, up to `frames`.
-    samples: UnsafeCell<Box<[f32]>>,
+    samples: UnsafeCell<Pages<f32>>,
     /// Each stored callback's timestamps and how many of its frames were stored.
-    rows: UnsafeCell<Box<[(Times, usize)]>>,
+    rows: UnsafeCell<Pages<(Times, usize)>>,
     /// Frames and callbacks written so far, published by the IO thread.
     frames: AtomicUsize,
     callbacks: AtomicUsize,
@@ -44,17 +47,77 @@ pub struct Capture {
 // thread reads only after the IOProc is gone.
 unsafe impl Sync for Capture {}
 
-/// A buffer of `len` times `zero` whose pages are all in memory. `vec![zero; len]` alone gets
-/// zero pages that the system only maps when they are first written, and here that would be in
-/// the IOProc, as a page fault on the IO thread. The writes are volatile so that the compiler
-/// can't drop them for storing what is already there.
-fn mapped<T: Copy>(zero: T, len: usize) -> Box<[T]> {
-    let mut buffer = vec![zero; len].into_boxed_slice();
-    for item in buffer.iter_mut() {
-        unsafe { std::ptr::write_volatile(item, zero) };
-    }
-    buffer
+/// `len` values mapped straight from the system, every page written once so that it is in
+/// memory: untouched pages would only be mapped when the IOProc first writes them, as page
+/// faults on the IO thread. Dropping it unmaps them, which hands the memory back at once.
+pub struct Pages<T: Copy> {
+    start: std::ptr::NonNull<T>,
+    len: usize,
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes this thread mapped through `Pages` that are still mapped, for the tests. Per
+    /// thread, so tests running side by side don't see each other's captures.
+    pub static MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl<T: Copy> Pages<T> {
+    fn new(zero: T, len: usize) -> Pages<T> {
+        let bytes = Self::bytes(len);
+        let start = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert!(
+            start != libc::MAP_FAILED,
+            "could not map {bytes} bytes for the capture"
+        );
+        let start = std::ptr::NonNull::new(start.cast::<T>()).expect("mmap returned null");
+        for i in 0..len {
+            // Volatile, so the compiler can't drop a store of what the fresh page already holds.
+            unsafe { std::ptr::write_volatile(start.as_ptr().add(i), zero) };
+        }
+        #[cfg(test)]
+        MAPPED.with(|mapped| mapped.set(mapped.get() + bytes));
+        Pages { start, len }
+    }
+
+    fn bytes(len: usize) -> usize {
+        (len * size_of::<T>()).max(1)
+    }
+}
+
+impl<T: Copy> std::ops::Deref for Pages<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.start.as_ptr(), self.len) }
+    }
+}
+
+impl<T: Copy> std::ops::DerefMut for Pages<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.start.as_ptr(), self.len) }
+    }
+}
+
+impl<T: Copy> Drop for Pages<T> {
+    fn drop(&mut self) {
+        let bytes = Self::bytes(self.len);
+        unsafe { libc::munmap(self.start.as_ptr().cast(), bytes) };
+        #[cfg(test)]
+        MAPPED.with(|mapped| mapped.set(mapped.get() - bytes));
+    }
+}
+
+// Plain memory that only its owner reaches.
+unsafe impl<T: Copy + Send> Send for Pages<T> {}
 
 impl Capture {
     /// A capture when one is asked for, allocated and paged in here on the control thread.
@@ -67,8 +130,8 @@ impl Capture {
             .clamp(1, MAX_SECONDS);
         let frames = seconds * dsp::SAMPLE_RATE as usize;
         Some(Box::new(Capture {
-            samples: UnsafeCell::new(mapped(0.0, frames * STREAMS)),
-            rows: UnsafeCell::new(mapped(([0.0; 4], 0), seconds * CALLBACKS_PER_SECOND)),
+            samples: UnsafeCell::new(Pages::new(0.0, frames * STREAMS)),
+            rows: UnsafeCell::new(Pages::new(([0.0; 4], 0), seconds * CALLBACKS_PER_SECOND)),
             frames: AtomicUsize::new(0),
             callbacks: AtomicUsize::new(0),
             config_dir: config_dir.to_owned(),
