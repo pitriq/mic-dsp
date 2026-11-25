@@ -7,12 +7,14 @@ use crate::meter::Meter;
 use crate::stages::compressor::Compressor;
 use crate::stages::deesser::Deesser;
 use crate::stages::denoise::{self, Denoise};
+use crate::stages::echo::{self, Echo, EchoStatus};
 use crate::stages::eq::Eq;
 use crate::stages::expander::Expander;
 use crate::stages::gain::Gain;
 use crate::stages::highpass::Highpass;
 use crate::stages::limiter::{self, Limiter};
 use crate::stages::{lin_to_db, Stage};
+use crate::EchoStateError;
 use crate::{FRAME, SAMPLE_RATE};
 
 /// Builds the chain and its control handle. It allocates everything the chain will ever
@@ -24,14 +26,17 @@ pub fn chain(config: &Config) -> (Chain, Control) {
     let core = Core::new(params);
     let (params_tx, params_rx) = handoff::latest(params);
     let (status_tx, status_rx) = handoff::latest(core.status());
+    let (echo_tx, echo_rx) = handoff::latest(core.echo_params);
     (
         Chain {
             params: params_rx,
+            echo: echo_rx,
             status: status_tx,
             core,
         },
         Control {
             params: params_tx,
+            echo: echo_tx,
             status: status_rx,
         },
     )
@@ -40,6 +45,7 @@ pub fn chain(config: &Config) -> (Chain, Control) {
 /// The vocal chain. Owned by the audio thread, and dropped on the control thread.
 pub struct Chain {
     params: Rx<Params>,
+    echo: Rx<echo::Params>,
     status: Tx<Status>,
     core: Core,
 }
@@ -47,6 +53,7 @@ pub struct Chain {
 /// The control thread's handle to a `Chain`.
 pub struct Control {
     params: Tx<Params>,
+    echo: Tx<echo::Params>,
     status: Rx<Status>,
 }
 
@@ -80,16 +87,19 @@ pub struct Status {
     pub zero_frames_total: u64,
     /// Nonfinite input samples so far. They are replaced by zero.
     pub invalid_samples: u64,
+    /// The echo canceller.
+    pub echo: EchoStatus,
 }
 
 impl Chain {
-    /// Samples from input to output, for any callback size: the re-blocking frame, the
-    /// denoiser's frame and the limiter's look-ahead.
-    pub const LATENCY: usize = FRAME + denoise::LATENCY + limiter::LOOKAHEAD;
+    /// Samples from input to output, for any callback size: the re-blocking frame, the echo
+    /// canceller, the denoiser's frame and the limiter's look-ahead.
+    pub const LATENCY: usize = FRAME + echo::LATENCY + denoise::LATENCY + limiter::LOOKAHEAD;
 
     /// Real-time safe, for any frame count including 0. Reads channel 0 of interleaved
     /// `input` and writes the processed mono to every channel of interleaved `output`. The
-    /// two frame counts must match.
+    /// two frame counts must match. With no reference the echo canceller only runs its 3 s
+    /// warm-up.
     pub fn process(
         &mut self,
         input: &[f32],
@@ -97,15 +107,38 @@ impl Chain {
         output: &mut [f32],
         out_channels: usize,
     ) {
-        #[cfg(debug_assertions)]
-        assert_no_alloc::assert_no_alloc(|| self.run(input, in_channels, output, out_channels));
-        #[cfg(not(debug_assertions))]
-        self.run(input, in_channels, output, out_channels);
+        self.process_with_reference(input, in_channels, &[], 1, output, out_channels);
     }
 
-    fn run(&mut self, input: &[f32], in_channels: usize, output: &mut [f32], out_channels: usize) {
+    /// `process`, with interleaved `reference` as the far end for the echo canceller: what
+    /// plays out of the speakers or headphones during this callback. The canceller is mono, so
+    /// it gets the mean of the reference's channels, which is what a mic at the same distance
+    /// from both speakers hears. A reference shorter than the input counts as silence for the
+    /// rest.
+    pub fn process_with_reference(
+        &mut self,
+        input: &[f32],
+        in_channels: usize,
+        reference: &[f32],
+        reference_channels: usize,
+        output: &mut [f32],
+        out_channels: usize,
+    ) {
+        let channels = [in_channels, reference_channels, out_channels];
+        #[cfg(debug_assertions)]
+        assert_no_alloc::assert_no_alloc(|| self.run(input, reference, output, channels));
+        #[cfg(not(debug_assertions))]
+        self.run(input, reference, output, channels);
+    }
+
+    /// `channels`: input, reference, output.
+    fn run(&mut self, input: &[f32], reference: &[f32], output: &mut [f32], channels: [usize; 3]) {
+        let [in_channels, reference_channels, out_channels] = channels;
         if let Some(params) = self.params.fresh() {
             self.core.apply(params);
+        }
+        if let Some(params) = self.echo.fresh() {
+            self.core.echo.set_params(params);
         }
         let frames = match (in_channels, out_channels) {
             (0, _) | (_, 0) => 0,
@@ -115,10 +148,60 @@ impl Chain {
         let (heard, silent) = output.split_at_mut(frames * out_channels);
         self.core.reblock(
             input.chunks_exact(in_channels.max(1)).map(|frame| frame[0]),
+            mean_of(reference, reference_channels),
             heard.chunks_exact_mut(out_channels.max(1)),
         );
         silent.fill(0.0);
         self.status.publish(self.core.status());
+    }
+}
+
+/// The mean of each interleaved frame's channels, then silence. With one channel the mean is
+/// the channel itself, bit for bit.
+fn mean_of(reference: &[f32], channels: usize) -> impl Iterator<Item = f32> + '_ {
+    let channels = channels.max(1);
+    let scale = 1.0 / channels as f32;
+    reference
+        .chunks_exact(channels)
+        .map(move |frame| frame.iter().sum::<f32>() * scale)
+        .chain(std::iter::repeat(0.0))
+}
+
+/// What the echo canceller has learned, saved and loaded. These allocate, so they are for the
+/// control thread, which has the chain to itself between two engines.
+impl Chain {
+    /// Replaces what the echo canceller has learned with a saved state, so that it cancels
+    /// from its first frame. After an error nothing has changed.
+    pub fn load_echo_preset(&mut self, state: &[u8]) -> Result<(), EchoStateError> {
+        let loaded = self.core.echo.load(state);
+        self.status.publish(self.core.status());
+        loaded
+    }
+
+    /// Starts a session, before the engine that runs it: [`EchoStatus::echo_level_db`] is
+    /// measured anew. With `candidate`, a second saved state, the session starts as a trial
+    /// of the canceller as it is against a second one loaded with it: both run until 2 s of
+    /// frames had far end in them or one is clearly ahead, the one that put out less stays,
+    /// and [`EchoStatus::trial`] says which. Without one, or with one that is refused, there
+    /// is no trial.
+    pub fn start_echo_session(&mut self, candidate: Option<&[u8]>) -> Result<(), EchoStateError> {
+        let loaded = self.core.echo.start_session(candidate);
+        self.status.publish(self.core.status());
+        loaded
+    }
+
+    /// What the echo canceller in use has learned, for the two calls above. `None` until it
+    /// has heard 2.5 s of far end.
+    pub fn echo_state(&self) -> Option<Vec<u8>> {
+        self.core.echo.state()
+    }
+}
+
+#[cfg(feature = "offline")]
+impl Chain {
+    /// What the echo canceller made of the latest frame, before the gain.
+    pub fn echo_output(&self) -> &[f32; FRAME] {
+        &self.core.echo_output
     }
 }
 
@@ -129,6 +212,12 @@ impl Control {
         self.params.publish(Params::derive(config));
     }
 
+    /// Wait-free. Where the echo's direct path lands after the reference, in samples, as the
+    /// device latencies put it. The canceller handles a change as a new echo path.
+    pub fn set_echo_delay(&mut self, samples: usize) {
+        self.echo.publish(echo::Params { delay: samples });
+    }
+
     /// Wait-free. The latest snapshot.
     pub fn status(&mut self) -> Status {
         self.status.latest()
@@ -137,6 +226,10 @@ impl Control {
 
 struct Core {
     highpass: Highpass,
+    /// The reference gets the same high-pass as the capture.
+    reference_highpass: Highpass,
+    echo: Echo,
+    echo_params: echo::Params,
     meter: Meter,
     gain: Gain,
     denoise: Denoise,
@@ -150,6 +243,10 @@ struct Core {
     /// Up to `filled`: input waiting for a full frame. From `filled`: the previous frame's
     /// output, not yet handed out. It starts as one frame of silence.
     block: [f32; FRAME],
+    /// The reference, re-blocked in step with `block`.
+    reference: [f32; FRAME],
+    #[cfg(feature = "offline")]
+    echo_output: [f32; FRAME],
     filled: usize,
 
     frames: u64,
@@ -161,8 +258,14 @@ struct Core {
 impl Core {
     fn new(params: Params) -> Core {
         let rate = SAMPLE_RATE as f32;
+        let echo_params = echo::Params {
+            delay: echo::DEFAULT_DELAY,
+        };
         Core {
             highpass: Highpass::new(rate, params.highpass),
+            reference_highpass: Highpass::new(rate, params.highpass),
+            echo: Echo::new(echo_params),
+            echo_params,
             meter: Meter::new(rate, params.meter),
             gain: Gain::new(rate, params.gain),
             denoise: Denoise::new(rate, params.denoise),
@@ -173,6 +276,9 @@ impl Core {
             deesser: Deesser::new(rate, params.deesser),
             limiter: Limiter::new(rate, params.limiter),
             block: [0.0; FRAME],
+            reference: [0.0; FRAME],
+            #[cfg(feature = "offline")]
+            echo_output: [0.0; FRAME],
             filled: 0,
             frames: 0,
             invalid_samples: 0,
@@ -196,6 +302,7 @@ impl Core {
             limiter,
         } = params;
         self.highpass.set_params(highpass);
+        self.reference_highpass.set_params(highpass);
         self.meter.set_params(meter);
         self.gain.set_params(gain);
         self.denoise.set_params(denoise);
@@ -213,9 +320,10 @@ impl Core {
     fn reblock<'a>(
         &mut self,
         input: impl Iterator<Item = f32>,
+        reference: impl Iterator<Item = f32>,
         output: impl Iterator<Item = &'a mut [f32]>,
     ) {
-        for (x, out) in input.zip(output) {
+        for ((x, far), out) in input.zip(reference).zip(output) {
             out.fill(self.block[self.filled]);
             self.block[self.filled] = if x.is_finite() {
                 x
@@ -223,6 +331,7 @@ impl Core {
                 self.invalid_samples += 1;
                 0.0
             };
+            self.reference[self.filled] = if far.is_finite() { far } else { 0.0 };
             self.filled += 1;
             self.frames += 1;
             if self.filled == FRAME {
@@ -236,12 +345,20 @@ impl Core {
         let x = &mut self.block;
         self.meter.inspect_raw(x);
         self.highpass.process(x);
+        self.reference_highpass.process(&mut self.reference);
+        self.echo.reference(&self.reference);
+        self.echo.process(x);
+        #[cfg(feature = "offline")]
+        {
+            self.echo_output = *x;
+        }
         self.meter.measure(x);
         self.gain.process(x);
         self.denoise.process(x);
         // The voice detection of this frame qualifies this frame's level, and leads the
         // denoiser's delayed audio by a frame, which gives the expander time to open.
         let voice = self.denoise.voice();
+        self.echo.voice(voice.speech);
         self.meter.update(voice);
         self.expander.key(voice.speech);
         self.expander.process(x);
@@ -270,6 +387,7 @@ impl Core {
             out_peak_dbfs: lin_to_db(self.out_peak),
             zero_frames_total: self.meter.zero_frames(),
             invalid_samples: self.invalid_samples,
+            echo: self.echo.status(),
         }
     }
 }
@@ -328,13 +446,14 @@ mod tests {
 
     #[test]
     fn latency_is_the_constant() {
-        assert_eq!(Chain::LATENCY, 480 + 480 + 48);
+        assert_eq!(Chain::LATENCY, 480 + 334 + 480 + 48);
         // Where the output lines up best with the input is the latency. The filters move
         // the waveform by a few samples at most.
-        let input = speechlike(5.0, 2, 0.3).samples;
+        // After the echo canceller's warm-up, when it is skipped.
+        let input = speechlike(7.0, 2, 0.3).samples;
         let output = process(&mut default_chain().0, &input, || 480);
         let correlation = |lag: usize| -> f64 {
-            (48_000..192_000)
+            (192_000..336_000)
                 .map(|i| (input[i - lag] * output[i]) as f64)
                 .sum()
         };
@@ -362,6 +481,119 @@ mod tests {
         for (frame, sample) in output.chunks(3).zip(&expected) {
             assert_eq!(frame, [*sample; 3]);
         }
+    }
+
+    #[test]
+    fn a_silent_reference_changes_nothing() {
+        let input = speechlike(6.0, 5, 1.0).samples;
+        let expected = process(&mut default_chain().0, &input, || 480);
+        let (mut chain, mut control) = default_chain();
+        let silence = [0.0f32; 2 * 512];
+        let mut output = vec![0.0; input.len()];
+        for (x, y) in input.chunks(512).zip(output.chunks_mut(512)) {
+            chain.process_with_reference(x, 1, &silence[..2 * x.len()], 2, y, 1);
+        }
+        assert!(output == expected);
+        // The warm-up, then nothing.
+        let echo = control.status().echo;
+        assert!(!echo.active);
+        assert_eq!(echo.active_frames, 300);
+    }
+
+    #[test]
+    fn the_far_end_is_the_mean_of_the_reference_channels() {
+        // Two different programmes on the two channels, and their echo in the mic.
+        let left = speechlike(6.0, 11, 1.0).samples;
+        let right = noise(left.len(), 0.05, 12);
+        let mean: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .map(|(l, r)| (l + r) * 0.5)
+            .collect();
+        let stereo: Vec<f32> = left
+            .iter()
+            .zip(&right)
+            .flat_map(|(l, r)| [*l, *r])
+            .collect();
+        let mic: Vec<f32> = (0..left.len())
+            .map(|i| i.checked_sub(480).map_or(0.0, |j| 0.5 * mean[j]))
+            .collect();
+
+        let run = |reference: &[f32], channels: usize| {
+            let (mut chain, mut control) = default_chain();
+            let mut output = vec![0.0; mic.len()];
+            for ((x, r), y) in mic
+                .chunks(512)
+                .zip(reference.chunks(512 * channels))
+                .zip(output.chunks_mut(512))
+            {
+                chain.process_with_reference(x, 1, r, channels, y, 1);
+            }
+            (output, control.status().echo)
+        };
+        let (expected, heard) = run(&mean, 1);
+        assert!(heard.active && heard.far_frames > 100, "{heard:?}");
+        let (output, status) = run(&stereo, 2);
+        assert!(output == expected);
+        assert_eq!(status, heard);
+
+        // Sound on the second channel alone is half as loud a far end, not silence.
+        let second: Vec<f32> = left.iter().flat_map(|l| [0.0, *l]).collect();
+        let halved: Vec<f32> = left.iter().map(|l| l * 0.5).collect();
+        assert!(run(&second, 2).0 == run(&halved, 1).0);
+        assert!(run(&second, 2).1.far_frames > 100);
+    }
+
+    /// What one chain's canceller has learned starts another chain's session: without the
+    /// warm-up, and without the echo.
+    #[test]
+    fn a_saved_echo_state_starts_another_chain() {
+        use crate::EchoTrial;
+
+        // A far end at the level calls play at, and its echo 10 dB under it.
+        let far: Vec<f32> = speechlike(12.0, 21, 1.0)
+            .samples
+            .iter()
+            .map(|x| 3.0 * x)
+            .collect();
+        let room = noise(far.len(), 0.0005, 22);
+        let mic: Vec<f32> = (0..far.len())
+            .map(|i| room[i] + i.checked_sub(480).map_or(0.0, |j| 0.3 * far[j]))
+            .collect();
+        let run = |chain: &mut Chain, range: std::ops::Range<usize>| {
+            let mut output = [0.0f32; 512];
+            for (x, r) in mic[range.clone()].chunks(512).zip(far[range].chunks(512)) {
+                chain.process_with_reference(x, 1, r, 1, &mut output[..x.len()], 1);
+            }
+        };
+
+        let (mut first, _) = default_chain();
+        assert_eq!(first.echo_state(), None);
+        run(&mut first, 0..9 * 48_000);
+        let state = first
+            .echo_state()
+            .expect("a canceller that heard 9 s of far end");
+
+        let (mut second, mut control) = default_chain();
+        second.load_echo_preset(&state).unwrap();
+        // The control handle sees a session start before any callback runs.
+        second.start_echo_session(Some(&state)).unwrap();
+        assert_eq!(control.status().echo.trial, EchoTrial::Running);
+        // A state that is refused changes nothing but the trial, which is off.
+        assert!(second.start_echo_session(Some(&state[..1000])).is_err());
+        assert_eq!(control.status().echo.trial, EchoTrial::None);
+        assert!(second.load_echo_preset(b"not a state").is_err());
+        assert!(second.echo_state() == Some(state.clone()));
+
+        // No warm-up: the canceller does not run before something plays.
+        process(&mut second, &room[..24_000], || 512);
+        assert_eq!(control.status().echo.active_frames, 0);
+        run(&mut second, 9 * 48_000..12 * 48_000);
+        let echo = control.status().echo;
+        let removed = echo.removed_db_since(&EchoStatus::default()).unwrap();
+        assert!(removed > 20.0, "removed {removed} dB");
+        let level = echo.echo_level_db.unwrap();
+        assert!((8.0..20.0).contains(&level), "{level} dB");
     }
 
     #[test]

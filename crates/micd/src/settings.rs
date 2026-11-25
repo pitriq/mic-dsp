@@ -85,13 +85,16 @@ impl Settings {
         }
     }
 
-    /// A chain for a new engine, with the current config.
-    pub fn chain(&mut self) -> (Chain, Control) {
+    /// A new chain with the current config, boxed so that handing it to an engine and taking it
+    /// back copies nothing.
+    pub fn chain(&mut self) -> (Box<Chain>, Control) {
         self.reload_config();
-        dsp::chain(&self.config)
+        let (chain, control) = dsp::chain(&self.config);
+        (Box::new(chain), control)
     }
 
-    /// The periodic work while a chain runs: applies a changed config.
+    /// Applies a config that changed since the last look: every second while a chain runs, and
+    /// when a kept chain goes to a new engine.
     pub fn tick(&mut self, control: &mut Control) {
         if self.reload_config() {
             control.set_config(&self.config);

@@ -9,7 +9,8 @@ use objc2_core_audio::{
     kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyDeviceIsRunningSomewhere,
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyIOProcStreamUsage,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
-    kAudioHardwareBadPropertySizeError, kAudioHardwarePropertyDevices,
+    kAudioDevicePropertyTransportType, kAudioHardwareBadPropertySizeError,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
     kAudioHardwarePropertyTranslateUIDToDevice, kAudioObjectPropertyElementMain,
     kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyScopeInput,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject, kAudioObjectUnknown,
@@ -18,8 +19,11 @@ use objc2_core_audio::{
     AudioObjectID, AudioObjectPropertyAddress, AudioObjectRemovePropertyListener,
     AudioObjectSetPropertyData,
 };
-use objc2_core_audio_types::AudioStreamBasicDescription;
-use objc2_core_foundation::{CFRetained, CFString};
+use objc2_core_audio_types::{
+    kAudioFormatFlagIsBigEndian, kAudioFormatFlagIsFloat, kAudioFormatFlagIsNonInterleaved,
+    kAudioFormatLinearPCM, AudioStreamBasicDescription,
+};
+use objc2_core_foundation::{CFArray, CFRetained, CFString, CFType};
 
 use crate::wake;
 
@@ -207,6 +211,42 @@ pub fn get_string(object: ObjectId, selector: u32, scope: u32) -> Result<String>
     Ok(string.to_string())
 }
 
+/// Reads a property that is an array of strings.
+pub fn get_strings(object: ObjectId, selector: u32, scope: u32) -> Result<Vec<String>> {
+    let address = address(selector, scope);
+    let mut value: *mut CFArray<CFType> = ptr::null_mut();
+    let mut size = size_of::<*mut CFArray<CFType>>() as u32;
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            object,
+            NonNull::from(&address),
+            0,
+            ptr::null(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut value).cast(),
+        )
+    };
+    check_property(status, "get", selector)?;
+    let bad = Error {
+        what: "get",
+        selector,
+        status: kAudioHardwareBadPropertySizeError,
+    };
+    let array = NonNull::new(value).ok_or(bad)?;
+    // The HAL hands the caller a reference to release.
+    let array = unsafe { CFRetained::from_raw(array) };
+    strings(&array).ok_or(bad)
+}
+
+/// The strings in `array`, or `None` if something in it is not a string.
+fn strings(array: &CFArray<CFType>) -> Option<Vec<String>> {
+    array
+        .to_vec()
+        .iter()
+        .map(|item| Some(item.downcast_ref::<CFString>()?.to_string()))
+        .collect()
+}
+
 pub fn set<T: Plain>(object: ObjectId, selector: u32, scope: u32, value: &T) -> Result<()> {
     let address = address(selector, scope);
     let status = unsafe {
@@ -281,6 +321,16 @@ pub fn device_for_uid(uid: &str) -> Result<Option<ObjectId>> {
     Ok((device != kAudioObjectUnknown).then_some(device))
 }
 
+/// The device the Mac plays to.
+pub fn default_output() -> Result<ObjectId> {
+    get(SYSTEM, kAudioHardwarePropertyDefaultOutputDevice, GLOBAL)
+}
+
+/// How a device is connected: one of the `kAudioDeviceTransportType` constants.
+pub fn transport_type(device: ObjectId) -> Result<u32> {
+    get(device, kAudioDevicePropertyTransportType, GLOBAL)
+}
+
 pub fn name(object: ObjectId) -> Result<String> {
     get_string(object, kAudioObjectPropertyName, GLOBAL)
 }
@@ -310,6 +360,27 @@ pub fn streams(device: ObjectId, scope: u32) -> Result<Vec<ObjectId>> {
 /// The format the IOProc sees for a stream.
 pub fn stream_format(stream: ObjectId) -> Result<AudioStreamBasicDescription> {
     get(stream, kAudioStreamPropertyVirtualFormat, GLOBAL)
+}
+
+/// The channel count of `format` if the IOProc can read it as interleaved native `f32` at
+/// 48 kHz. One channel is interleaved whatever the flag says.
+pub fn float_channels(format: &AudioStreamBasicDescription) -> Option<u32> {
+    let channels = format.mChannelsPerFrame;
+    let float = format.mFormatID == kAudioFormatLinearPCM
+        && format.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        && format.mFormatFlags & kAudioFormatFlagIsBigEndian == 0
+        && format.mBitsPerChannel == 32;
+    let interleaved = format.mFormatFlags & kAudioFormatFlagIsNonInterleaved == 0 || channels == 1;
+    let usable = float && interleaved && format.mSampleRate == f64::from(dsp::SAMPLE_RATE);
+    (usable && channels > 0).then_some(channels)
+}
+
+/// How a format that is not usable shows up in the log.
+pub fn describe_format(format: &AudioStreamBasicDescription) -> String {
+    format!(
+        "{} Hz, {} ch, {} bits, flags {:#x}",
+        format.mSampleRate, format.mChannelsPerFrame, format.mBitsPerChannel, format.mFormatFlags
+    )
 }
 
 /// An `AudioHardwareIOProcStreamUsage` with room for `count` streams. The struct ends in a
@@ -402,4 +473,59 @@ pub fn stream_usage(
     };
     check_property(status, "get", kAudioDevicePropertyIOProcStreamUsage)?;
     Ok(usage.flags().iter().map(|&flag| flag != 0).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_audio_types::{kAudioFormatFlagIsPacked, kAudioFormatFlagIsSignedInteger};
+
+    use super::*;
+
+    fn format(rate: f64, channels: u32, bits: u32, flags: u32) -> AudioStreamBasicDescription {
+        AudioStreamBasicDescription {
+            mSampleRate: rate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: flags,
+            mBytesPerPacket: channels * bits / 8,
+            mFramesPerPacket: 1,
+            mBytesPerFrame: channels * bits / 8,
+            mChannelsPerFrame: channels,
+            mBitsPerChannel: bits,
+            mReserved: 0,
+        }
+    }
+
+    #[test]
+    fn an_array_property_is_read_as_strings_only_if_it_holds_nothing_else() {
+        let uids = [CFString::from_str("komplete"), CFString::from_str("feed")];
+        let items: Vec<&CFType> = uids.iter().map(|uid| uid.as_ref()).collect();
+        let array = CFArray::from_objects(&items);
+        assert_eq!(strings(&array).unwrap(), ["komplete", "feed"]);
+        assert_eq!(strings(&CFArray::empty()).unwrap(), [""; 0]);
+
+        let number = objc2_core_foundation::CFNumber::new_i32(7);
+        let mixed = CFArray::from_objects(&[items[0], number.as_ref()]);
+        assert_eq!(strings(&mixed), None);
+    }
+
+    #[test]
+    fn only_interleaved_native_float32_at_48_khz_is_usable() {
+        // Packed float, which is what the Komplete, the feed and the loopback report.
+        let float = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+        assert_eq!(float_channels(&format(48_000.0, 2, 32, float)), Some(2));
+        assert_eq!(float_channels(&format(48_000.0, 1, 32, float)), Some(1));
+        let planar = float | kAudioFormatFlagIsNonInterleaved;
+        assert_eq!(float_channels(&format(48_000.0, 1, 32, planar)), Some(1));
+        assert_eq!(float_channels(&format(48_000.0, 2, 32, planar)), None);
+        assert_eq!(float_channels(&format(44_100.0, 2, 32, float)), None);
+        assert_eq!(float_channels(&format(48_000.0, 2, 64, float)), None);
+        let integer = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+        assert_eq!(float_channels(&format(48_000.0, 2, 32, integer)), None);
+        let big = float | kAudioFormatFlagIsBigEndian;
+        assert_eq!(float_channels(&format(48_000.0, 2, 32, big)), None);
+        assert_eq!(float_channels(&format(48_000.0, 0, 32, float)), None);
+        let mut other = format(48_000.0, 2, 32, float);
+        other.mFormatID = u32::from_be_bytes(*b"aac ");
+        assert_eq!(float_channels(&other), None);
+    }
 }

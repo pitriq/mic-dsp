@@ -2,8 +2,10 @@
 //! AVFoundation is loaded the first time it is needed, so micd doesn't carry it until the input
 //! goes dead. Control thread only.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::CStr;
 use std::fmt;
+
+use crate::objc::{self, Id, Sel};
 
 pub enum Permission {
     NotDetermined,
@@ -26,22 +28,6 @@ impl fmt::Display for Permission {
     }
 }
 
-#[link(name = "objc")]
-extern "C" {
-    fn objc_getClass(name: *const c_char) -> *mut c_void;
-    fn sel_registerName(name: *const c_char) -> *mut c_void;
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
-    /// Declared with the one signature it is called with here, which is how `objc_msgSend` is
-    /// meant to be called on arm64.
-    #[link_name = "objc_msgSend"]
-    fn authorization_status_for(
-        class: *mut c_void,
-        selector: *mut c_void,
-        media: *mut c_void,
-    ) -> isize;
-}
-
 const AVFOUNDATION: &CStr = c"/System/Library/Frameworks/AVFoundation.framework/AVFoundation";
 
 pub fn microphone() -> Permission {
@@ -57,16 +43,15 @@ pub fn microphone() -> Permission {
             };
             return Permission::Unknown(error);
         }
-        let media = libc::dlsym(framework, c"AVMediaTypeAudio".as_ptr()).cast::<*mut c_void>();
-        let class = objc_getClass(c"AVCaptureDevice".as_ptr());
+        let media = libc::dlsym(framework, c"AVMediaTypeAudio".as_ptr()).cast::<Id>();
+        let class = objc::class(c"AVCaptureDevice");
         if media.is_null() || (*media).is_null() || class.is_null() {
             return Permission::Unknown("AVFoundation has no AVCaptureDevice".into());
         }
-        let selector = sel_registerName(c"authorizationStatusForMediaType:".as_ptr());
-        let pool = objc_autoreleasePoolPush();
-        let status = authorization_status_for(class, selector, *media);
-        objc_autoreleasePoolPop(pool);
-        match status {
+        let status_for: unsafe extern "C" fn(Id, Sel, Id) -> isize = objc::send();
+        let _pool = objc::Pool::new();
+        let selector = objc::selector(c"authorizationStatusForMediaType:");
+        match status_for(class, selector, *media) {
             0 => Permission::NotDetermined,
             1 => Permission::Restricted,
             2 => Permission::Denied,

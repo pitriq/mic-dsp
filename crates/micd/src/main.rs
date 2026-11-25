@@ -1,6 +1,8 @@
 //! micd: the always-on virtual mic daemon. While an app reads "Francisco's Mic", it takes the
-//! Komplete Audio 1's input, processes it and writes it to the driver's hidden feed. See
-//! `docs/design.md`.
+//! Komplete Audio 1's input, processes it and writes it to the driver's hidden feed. The Mac
+//! plays through a Multi-Output Device to the Komplete and to "Francisco's Speakers"; micd
+//! reads the latter's loopback, and the chain's echo canceller removes what plays from the mic.
+//! See `docs/design.md`.
 
 use std::process::ExitCode;
 
@@ -11,11 +13,14 @@ macro_rules! log {
     };
 }
 
+mod capture;
 mod daemon;
 mod engine;
 mod hal;
 mod io;
+mod objc;
 mod permission;
+mod presets;
 mod settings;
 mod wake;
 
