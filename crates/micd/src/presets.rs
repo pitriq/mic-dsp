@@ -111,10 +111,12 @@ impl Session {
     /// The status line's part about the session's trial of two presets, when it had one.
     pub fn describe_trial(&self, echo: &EchoStatus) -> Option<String> {
         let (current, candidate) = (self.current?, self.candidate?);
-        let levels = || {
+        // The level of the preset that stays comes first, as its name does.
+        let levels = |switched: bool| {
             echo.trial_levels_dbfs()
-                .map_or(String::new(), |[kept, tried]| {
-                    format!(" ({kept:.1} against {tried:.1} dBFS out)")
+                .map_or(String::new(), |[current, tried]| {
+                    let (won, lost) = if switched { (tried, current) } else { (current, tried) };
+                    format!(" ({won:.1} against {lost:.1} dBFS out)")
                 })
         };
         match echo.trial {
@@ -122,11 +124,11 @@ impl Session {
             EchoTrial::Running => Some(format!("trying the {candidate} preset against {current}")),
             EchoTrial::Kept => Some(format!(
                 "kept the {current} preset over {candidate}{}",
-                levels()
+                levels(false)
             )),
             EchoTrial::Switched => Some(format!(
                 "took the {candidate} preset over {current}{}",
-                levels()
+                levels(true)
             )),
         }
     }
@@ -508,7 +510,7 @@ mod tests {
         echo.trial = EchoTrial::Switched;
         assert_eq!(
             session.describe_trial(&echo).unwrap(),
-            "took the speakers preset over headphones (-48.3 against -72.0 dBFS out)"
+            "took the speakers preset over headphones (-72.0 against -48.3 dBFS out)"
         );
         echo.trial_out = [energy(-73.5), energy(-73.1)];
         echo.trial = EchoTrial::Kept;

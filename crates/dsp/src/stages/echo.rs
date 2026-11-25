@@ -61,6 +61,10 @@ const TRIAL_FRAMES: u32 = 200;
 /// headphones recording they stay within 1.3 dB, so there the 2 s decide.
 const TRIAL_CLEAR: f64 = 10.0;
 const TRIAL_CLEAR_FRAMES: u32 = 25;
+/// The other canceller takes over only once it has put out this many times less energy than
+/// the one in use (3 dB). Where both take the echo down to the room's noise, as on headphones,
+/// they end within a dB of each other, and the one in use stays.
+const TRIAL_MARGIN: f64 = 2.0;
 /// The echo's level is measured over this many far-end-only frames at a time: 0.25 s.
 const LEVEL_FRAMES: u32 = 25;
 
@@ -282,7 +286,7 @@ impl Echo {
                     && (tried_out * TRIAL_CLEAR < kept || kept * TRIAL_CLEAR < tried_out);
                 if clear || status.trial_frames >= TRIAL_FRAMES {
                     // Less came out of the one that took more echo off.
-                    if tried_out < kept {
+                    if tried_out * TRIAL_MARGIN < kept {
                         for (i, (x, y)) in frame.iter_mut().zip(&tried).enumerate() {
                             let fade = (i + 1) as f32 / FRAME as f32;
                             *x = (1.0 - fade) * *x + fade * y;
@@ -500,7 +504,8 @@ mod tests {
     }
 
     /// A canceller that is not clearly ahead after 0.25 s gets the whole 2 s. Here the one
-    /// with the weak echo's state relearns this one-tap echo within the second.
+    /// with the weak echo's state relearns this one-tap echo within the second and ends under
+    /// a dB behind, which is not enough for the other to take over.
     #[test]
     fn a_trial_without_a_clear_lead_runs_its_two_seconds() {
         let [strong, weak] = states();
@@ -508,11 +513,11 @@ mod tests {
         let mut echo = loaded(weak, Some(strong));
         run(&mut echo, &far, &mic);
         let status = echo.status();
-        assert_eq!(status.trial, EchoTrial::Switched, "{status:?}");
+        assert_eq!(status.trial, EchoTrial::Kept, "{status:?}");
         assert_eq!(status.trial_frames, TRIAL_FRAMES);
         let [kept, tried] = status.trial_levels_dbfs().unwrap();
         assert!(
-            tried < kept && kept < tried + 10.0,
+            tried < kept && kept < tried + 3.0,
             "{kept} against {tried} dBFS"
         );
     }
